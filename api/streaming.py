@@ -919,6 +919,23 @@ def _webui_surface_context_prompt(surface_context: Optional[dict]) -> str:
         value = str(raw).strip() if raw is not None else ""
         if value:
             lines.append(f"- {label}: {value}")
+    # Per-session auto-attached location (v2 — set via the ?? button in the
+    # composer). Rendered as ordinary session metadata, never into message
+    # history. If the user has not shared a location for this session, this is
+    # simply absent.
+    loc = surface_context.get("location")
+    if loc and isinstance(loc, dict):
+        lat = loc.get("lat")
+        lon = loc.get("lon")
+        acc = loc.get("accuracy_m")
+        label = (loc.get("label") or "").strip()
+        if lat is not None and lon is not None:
+            loc_str = f"{lat}, {lon}"
+            if acc:
+                loc_str += f" (±{acc}m)"
+            if label:
+                loc_str += f" ({label})"
+            lines.append(f"- Location: {loc_str}")
     return "\n".join(lines)
 
 
@@ -10076,6 +10093,10 @@ def _run_agent_streaming(
                     # workspace_system_msg above. Live workspace switches stay out
                     # of msg[0] so LLM prefix caches are not invalidated.
                     'workspace': _session_workspace_frozen,
+                    # Per-session auto-attached location (v2). Transparent like a
+                    # website header: set once by the browser (POST /api/location),
+                    # then present on every turn without appearing in history.
+                    'location': getattr(s, 'location', None),
                 },
                 config_data=_cfg,
             )

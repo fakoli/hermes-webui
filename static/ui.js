@@ -9982,6 +9982,7 @@ async function refreshSession() {
   try {
     const data = await api(`/api/session?session_id=${encodeURIComponent(S.session.session_id)}`);
     S.session = data.session;
+    if(typeof _refreshLocationChip==='function') _refreshLocationChip();
     if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(data.session);
     S.messages = data.session.messages || [];
     _messagesTruncated = !!data.session._messages_truncated;
@@ -21512,6 +21513,44 @@ function renderTray(){ // non-media files use paperclip chip
     };
     tray.appendChild(chip);
   });
+}
+function shareLocation(){
+  // "Share my location" — v1: uses the browser Geolocation API (always shows a
+  // native permission prompt), formats the result as text, and sends it as a
+  // normal chat message so the agent receives the coordinates.
+  if(!navigator.geolocation){
+    if(typeof showToast==='function')showToast('Geolocation is not supported in this browser',4000,'error');
+    else alert('Geolocation is not supported in this browser');
+    return;
+  }
+  // If the composer is busy (agent streaming), queue rather than blocking.
+  const _composer=$('msg');
+  const _text=_composer?_composer.value.trim():'';
+  navigator.geolocation.getCurrentPosition(
+    (pos)=>{
+      const lat=pos.coords.latitude.toFixed(6);
+      const lon=pos.coords.longitude.toFixed(6);
+      const acc=pos.coords.accuracy?Math.round(pos.coords.accuracy)+'m':'';
+      // Insert into composer (or prepend if something's already there)
+      const locationLine=`📍 My location: ${lat}, ${lon}${acc?` (±${acc})`:''}`;
+      if(_composer){
+        _composer.value=_composer.value.trim()? _composer.value.trim()+'\n'+locationLine : locationLine;
+        if(typeof autoResize==='function')autoResize();
+        if(typeof updateSendBtn==='function')updateSendBtn();
+        _composer.focus();
+      }
+      if(typeof showToast==='function')showToast('Location added to message',2500,'success');
+    },
+    (err)=>{
+      let msg='Could not get location';
+      if(err&&err.code===1)msg='Location access denied — enable it in your browser settings to share your location';
+      else if(err&&err.code===2)msg='Location unavailable (GPS/sensors off?)';
+      else if(err&&err.code===3)msg='Location request timed out';
+      if(typeof showToast==='function')showToast(msg,5000,'error');
+      else alert(msg);
+    },
+    {enableHighAccuracy:true,timeout:10000,maximumAge:60000}
+  );
 }
 function _uploadTooLargeMessage(file){
   const fileSizeMb=Math.ceil(((file&&file.size)||0)/1024/1024);

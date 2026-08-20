@@ -1342,6 +1342,10 @@ class Session:
         self.composer_draft = composer_draft if isinstance(composer_draft, dict) else {}
         self.anchor_activity_scenes = anchor_activity_scenes if isinstance(anchor_activity_scenes, dict) else {}
         self.process_wakeup_pause = process_wakeup_pause if isinstance(process_wakeup_pause, dict) else {}
+        # Per-session location sharing (v2 — auto-attach like a website header).
+        # Persisted with the session; surfaced to the agent via the ephemeral
+        # system prompt, never injected into visible message history.
+        self.location = kwargs.get("location") or None
         self.share_token = str(share_token).strip() if share_token else None
         self.share_created_at = share_created_at
         # #5854: a compact fingerprint of anchor_activity_scenes ({scene_key:
@@ -1792,6 +1796,7 @@ class Session:
             'active_stream_id': self.active_stream_id,
             'pending_user_message': self.pending_user_message,
             'has_pending_user_message': has_pending_user_message,
+            'location': self.location,
             'is_cli_session': self.is_cli_session,
             'source_tag': self.source_tag,
             'raw_source': self.raw_source,

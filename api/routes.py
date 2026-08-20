@@ -5210,6 +5210,71 @@ def _handle_session_anchor_scene(handler, body):
     return j(handler, {"ok": True, "message_index": idx, "message_ref": ref})
 
 
+def _handle_chat_location_get(handler, parsed):
+    """GET /api/location — read the per-session auto-attached location."""
+    qs = parsed.query if hasattr(parsed, "query") else {}
+    if not isinstance(qs, dict):
+        qs = {}
+    sid = str(qs.get("session_id") or "").strip()
+    if not sid:
+        return bad(handler, "session_id is required", 400)
+    try:
+        s = _get_or_materialize_session(sid)
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    except PermissionError:
+        return bad(handler, "Read-only imported sessions cannot be modified", 403)
+    if not _session_visible_to_active_profile(getattr(s, "profile", None) or None, handler):
+        return bad(handler, "Session not found", 404)
+    return j(handler, {"ok": True, "location": getattr(s, "location", None)}, status=200)
+
+
+def _handle_chat_location_set(handler, body):
+    """POST /api/location — set/clear the per-session auto-attached location.
+
+    Mirrors _handle_session_anchor_scene: require session_id, load/maybe
+    materialize, guard visibility, mutate, persist without touching the
+    message index. ``location`` is a small dict like
+    {"lat": 40.746586, "lon": -73.988907, "accuracy_m": 9, "label": "NoMad"}
+    or None to clear.
+    """
+    try:
+        require(body, "session_id")
+    except ValueError as exc:
+        return bad(handler, str(exc))
+    sid = str(body.get("session_id") or "").strip()
+    if not sid:
+        return bad(handler, "session_id is required", 400)
+    raw = body.get("location")
+    if raw is not None and not isinstance(raw, dict):
+        return bad(handler, "location must be an object or null", 400)
+    try:
+        s = _get_or_materialize_session(sid)
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    except PermissionError:
+        return bad(handler, "Read-only imported sessions cannot be modified", 403)
+    if not _session_visible_to_active_profile(getattr(s, "profile", None) or None, handler):
+        return bad(handler, "Session not found", 404)
+    loc = None
+    if raw:
+        try:
+            lat = float(raw.get("lat"))
+            lon = float(raw.get("lon"))
+        except (TypeError, ValueError):
+            return bad(handler, "location.lat and location.lon must be numbers", 400)
+        loc = {
+            "lat": round(lat, 6),
+            "lon": round(lon, 6),
+            "accuracy_m": int(raw.get("accuracy_m") or 0),
+            "label": str(raw.get("label") or "")[:120],
+        }
+    with _get_session_agent_lock(sid):
+        s.location = loc
+        s.save(touch_updated_at=False, skip_index=True)
+    return j(handler, {"ok": True, "location": loc}, status=200)
+
+
 def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False):
     """Get a session, materializing from CLI/agent metadata if not in WebUI store.
 
@@ -12670,6 +12735,10 @@ def handle_get(handler, parsed) -> bool:
         with profile_env_for_active_request_readonly("/api/providers", logger_override=logger):
             return j(handler, get_providers())
 
+    # ── Per-session location (auto-attach; see _handle_chat_location_*) ──
+    if parsed.path == "/api/location":
+        return _handle_chat_location_get(handler, parsed)
+
     # ── Plugins/hooks visibility (read-only, no callback/source internals) ──
     if parsed.path == "/api/plugins":
         return _handle_plugins(handler, parsed)
@@ -15682,6 +15751,9 @@ def handle_post(handler, parsed) -> bool:
 
     if parsed.path == "/api/bg-task-complete-ack":
         return _handle_bg_task_complete_ack(handler, body)
+
+    if parsed.path == "/api/location":
+        return _handle_chat_location_set(handler, body)
 
     if parsed.path == "/api/chat/start":
         return _handle_chat_start(handler, body, diag=diag)

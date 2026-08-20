@@ -1372,6 +1372,10 @@ async function send(){
   }
   _sendInProgress = true;
   try{
+  // #loc-v2: transparent auto-attach location (like a website header).
+  // Fire-and-forget: if the pref is ON and this session has no location yet,
+  // ask the browser once and POST it — never blocks the send.
+  if(typeof window._maybeAutoAttachLocation==='function') window._maybeAutoAttachLocation();
   const options=arguments[0]||{};
   const literalSlash=!!(options&&options.literalSlash);
   let text=$('msg').value.trim();

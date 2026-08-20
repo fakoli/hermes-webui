@@ -777,7 +777,93 @@ function _micToastKeyForRecognitionError(error){
   }
   window._applyDictationAppendPreference=_applyDictationAppendPreference;
 
-  async function _sendRawAudio(blob){
+  // ── Per-session auto-attach location (v2) ─────────────────────────────
+  // Browser asks once (native prompt), coordinates are POSTed to
+  // /api/location, and the server injects them into the agent's ephemeral
+  // context on every turn — transparently, like a website's header.
+  // Controlled by the Settings → Conversation → "Ask for my location on
+  // new conversations" toggle (default ON).
+  function _askLocationPref(){
+    try{return localStorage.getItem('hermes-ask-location')!=='false';}catch(_){return true;}
+  }
+  window._askLocationPref=_askLocationPref;
+  window._setAskLocationPref=function(v){_askLocationPref=function(){return !!v;};};
+
+  async function _postSessionLocation(sid, lat, lon, accuracyM, label){
+    try{
+      await api('/api/location',{
+        method:'POST',
+        body:JSON.stringify({session_id:sid, location:{lat,lon,accuracy_m:accuracyM||0,label:label||''}})
+      });
+      _refreshLocationChip();
+      return true;
+    }catch(_){ return false; }
+  }
+  window._postSessionLocation=_postSessionLocation;
+
+  function _refreshLocationChip(){
+    // Small status chip near the composer: shows the active auto-attached
+    // location for this session (or hides when none). Clicking clears it.
+    let chip=document.getElementById('locationAutoChip');
+    if(!chip){
+      chip=document.createElement('button');
+      chip.id='locationAutoChip';
+      chip.type='button';
+      chip.className='location-auto-chip';
+      chip.title='Auto-attached location — click to clear';
+      chip.setAttribute('aria-label','Auto-attached location — click to clear');
+      const tray=$('attachTray');
+      if(tray&&tray.parentNode) tray.parentNode.insertBefore(chip, tray.nextSibling);
+      else return;
+      chip.addEventListener('click', async ()=>{
+        const sid=S&&S.session&&S.session.session_id;
+        if(sid){
+          try{await api('/api/location',{method:'POST',body:JSON.stringify({session_id:sid,location:null})});}catch(_){}
+        }
+        chip.hidden=true;
+      });
+    }
+    const loc=S&&S.session&&S.session.location;
+    if(loc&&loc.lat!=null&&loc.lon!=null){
+      const label=(loc.label||'').trim()||'Location on';
+      chip.textContent='📍 '+label;
+      chip.title='Auto-attached location — click to clear';
+      chip.hidden=false;
+    }else{
+      chip.hidden=true;
+    }
+  }
+  window._refreshLocationChip=_refreshLocationChip;
+
+  // Called once per session from send(): if the pref is ON and this session
+  // doesn't have a location yet, request the browser permission (native
+  // prompt) and POST the result. Fires-and-forgets — never blocks the send.
+  function _maybeAutoAttachLocation(){
+    try{
+      if(!_askLocationPref()) return;
+      if(!navigator.geolocation) return;
+      const sid=S&&S.session&&S.session.session_id;
+      if(!sid) return;
+      if(S.session&&S.session.location&&S.session.location.lat!=null) return;
+      // One browser-native permission prompt; remember in this session only.
+      navigator.geolocation.getCurrentPosition(
+        async (pos)=>{
+          const lat=+pos.coords.latitude.toFixed(6);
+          const lon=+pos.coords.longitude.toFixed(6);
+          const acc=pos.coords.accuracy?Math.round(pos.coords.accuracy):0;
+          await _postSessionLocation(sid, lat, lon, acc, '');
+          // Update the local session object so the UI + server agree.
+          if(S&&S.session){S.session.location={lat,lon,accuracy_m:acc,label:''};}
+          _refreshLocationChip();
+        },
+        ()=>{ /* user denied or error — stay silent, manual button still works */ },
+        {enableHighAccuracy:true,timeout:8000,maximumAge:60000}
+      );
+    }catch(_){}
+  }
+  window._maybeAutoAttachLocation=_maybeAutoAttachLocation;
+
+  function _sendRawAudio(blob){
     const ext=(blob.type&&blob.type.includes('ogg'))?'ogg':'webm';
     const file=new File([blob],`voice-input-${Date.now()}.${ext}`,{type:blob.type||`audio/${ext}`});
     S.pendingFiles.push(file);
@@ -1321,6 +1407,15 @@ function _micToastKeyForRecognitionError(error){
     appendCheckbox.checked = _dictationAppend;
     appendCheckbox.addEventListener('change', function(){
       _applyDictationAppendPreference(this.checked);
+    });
+  }
+  // "Ask for my location on new conversations" (auto-attach, like a website).
+  const locationCheckbox = document.getElementById('settingsAskLocation');
+  if(locationCheckbox){
+    locationCheckbox.checked = _askLocationPref();
+    locationCheckbox.addEventListener('change', function(){
+      try{localStorage.setItem('hermes-ask-location', this.checked?'true':'false');}catch(_){}
+      if(typeof window._setAskLocationPref==='function') window._setAskLocationPref(this.checked);
     });
   }
   _updateMicTooltip();
