@@ -124,3 +124,28 @@ python3 bootstrap.py
 
 Do not include private machine instructions in this tracked file. Use a
 git-ignored local note for personal workflow details.
+
+## Fork-specific notes (fakoli/hermes-webui)
+
+This repository is a **fork** of `nesquena/hermes-webui` with local feature
+commits on `master`.
+
+**Before upgrading or pulling upstream, read `UPGRADE.md`** — it has the full
+sync procedure, the feature summary (per-session auto-attach location), and
+conflict-resolution notes.
+
+Key rules for agents working here:
+
+- **Remotes**: `origin` = `fakoli/hermes-webui` (fork), `upstream` =
+  `nesquena/hermes-webui` (original). Do not change these.
+- **To sync with upstream**: run `scripts/sync-upstream.sh` (dry-run) then
+  `scripts/sync-upstream.sh --rebase`. Never force-push.
+- **Do not commit the unrelated local file `api/paths.py`** (a separate local
+  change) or any `.webui-password.txt`.
+- **After any `api/*.py` change**, the server must be restarted via launchd
+  (`launchctl bootout` + `bootstrap` of `ai.hermes.webui`) — `bootstrap` is
+  blocked from inside the Hermes gateway, so run it from a real shell.
+  Static `static/` changes are live on browser refresh.
+- Feature gets injected into the agent's ephemeral system prompt via
+  `api/streaming.py:_webui_surface_context_prompt` — preserve that seam.
+
