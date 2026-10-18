@@ -11680,7 +11680,6 @@ from api.workspace import (
     list_workspace_suggestions,
     read_file_content,
     read_authorized_escape_file_content,
-    safe_resolve_ws,
     raw_authorized_escape_target,
     resolve_trusted_workspace,
     _resolve_path,
