@@ -299,7 +299,6 @@ def test_duplicate_explicitly_persists_to_disk():
     # persistence into a different route. Do not borrow a later route's save.
     helper_start = content.find('def _clone_webui_session(')
     assert helper_start != -1, 'Clone helper not found'
-    endpoint_code = content[helper_start:content.find('\n\ndef _persist_cloned_session', helper_start)]
     persist_start = content.find('def _persist_cloned_session(', helper_start)
     persist_code = content[persist_start:content.find('\n\n_ANCHOR_ACTIVITY', persist_start)]
     assert 'session.save()' in persist_code, \
