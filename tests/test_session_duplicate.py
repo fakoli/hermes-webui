@@ -98,7 +98,9 @@ def test_duplicate_creates_independent_session():
 
     # Extract the duplicate endpoint code (next few lines)
     lines = content[duplicate_start:].split('\n')
-    endpoint_code = '\n'.join(lines[:100])
+    helper_start = content.find('def _clone_webui_session(')
+    assert helper_start != -1, 'Clone helper not found'
+    endpoint_code = content[helper_start:content.find('\n\ndef _persist_cloned_session', helper_start)]
 
     # Verify that parent_session_id is NOT passed to Session constructor
     assert 'parent_session_id' not in endpoint_code, \
@@ -108,6 +110,7 @@ def test_duplicate_creates_independent_session():
     # corrected deepcopy form added May 2 2026).
     assert 'messages=session.messages' in endpoint_code or \
            'messages=copy.deepcopy(session.messages)' in endpoint_code or \
+           'messages=copy.deepcopy(copy_messages)' in endpoint_code or \
            'messages=copied_session.messages' in endpoint_code, \
         "Messages should be copied to duplicate"
 
@@ -127,7 +130,9 @@ def test_duplicate_session_copies_title_logic():
     assert duplicate_start != -1, "Duplicate endpoint not found"
 
     lines = content[duplicate_start:].split('\n')
-    endpoint_code = '\n'.join(lines[:100])
+    helper_start = content.find('def _clone_webui_session(')
+    assert helper_start != -1, 'Clone helper not found'
+    endpoint_code = content[helper_start:content.find('\n\ndef _persist_cloned_session', helper_start)]
 
     # Verify title includes (copy). Accept the original `session.title + " (copy)"`
     # form OR the May 2 2026 SF-3 hardened form `(session.title or "Untitled") + " (copy)"`
@@ -150,13 +155,16 @@ def test_duplicate_session_copies_messages_logic():
     assert duplicate_start != -1, "Duplicate endpoint not found"
 
     lines = content[duplicate_start:].split('\n')
-    endpoint_code = '\n'.join(lines[:100])
+    helper_start = content.find('def _clone_webui_session(')
+    assert helper_start != -1, 'Clone helper not found'
+    endpoint_code = content[helper_start:content.find('\n\ndef _persist_cloned_session', helper_start)]
 
     # Verify messages are copied from original session.  Accept either the
     # plain assignment (insufficient — see test_duplicate_runtime_messages_independence)
     # or the proper deepcopy form (the May 2 2026 fix).
     assert 'messages=session.messages' in endpoint_code or \
-           'messages=copy.deepcopy(session.messages)' in endpoint_code, \
+           'messages=copy.deepcopy(session.messages)' in endpoint_code or \
+           'messages=copy.deepcopy(copy_messages)' in endpoint_code, \
         f"Messages should be copied from original. Got: {endpoint_code}"
 
 
@@ -171,10 +179,12 @@ def test_duplicate_session_copies_model_logic():
     assert duplicate_start != -1, "Duplicate endpoint not found"
 
     lines = content[duplicate_start:].split('\n')
-    endpoint_code = '\n'.join(lines[:100])
+    helper_start = content.find('def _clone_webui_session(')
+    assert helper_start != -1, 'Clone helper not found'
+    endpoint_code = content[helper_start:content.find('\n\ndef _persist_cloned_session', helper_start)]
 
     # Verify model is copied
-    assert 'model=session.model' in endpoint_code, \
+    assert ('model=destination_model' in endpoint_code or 'model=session.model' in endpoint_code), \
         f"Model should be copied. Got: {endpoint_code}"
 
 
@@ -189,7 +199,9 @@ def test_duplicate_session_copies_workspace_logic():
     assert duplicate_start != -1, "Duplicate endpoint not found"
 
     lines = content[duplicate_start:].split('\n')
-    endpoint_code = '\n'.join(lines[:100])
+    helper_start = content.find('def _clone_webui_session(')
+    assert helper_start != -1, 'Clone helper not found'
+    endpoint_code = content[helper_start:content.find('\n\ndef _persist_cloned_session', helper_start)]
 
     # Verify workspace is copied
     assert 'workspace=session.workspace' in endpoint_code, \
@@ -207,10 +219,12 @@ def test_duplicate_session_copies_all_session_properties():
     assert duplicate_start != -1, "Duplicate endpoint not found"
 
     lines = content[duplicate_start:].split('\n')
-    endpoint_code = '\n'.join(lines[:100])
+    helper_start = content.find('def _clone_webui_session(')
+    assert helper_start != -1, 'Clone helper not found'
+    endpoint_code = content[helper_start:content.find('\n\ndef _persist_cloned_session', helper_start)]
 
     # Extract the copied_session = Session( lines
-    session_construction_start = endpoint_code.find('copied_session = Session(')
+    session_construction_start = endpoint_code.find('copied = Session(')
     assert session_construction_start != -1, "Should construct copied_session"
 
     # Get the construction block
@@ -222,8 +236,8 @@ def test_duplicate_session_copies_all_session_properties():
     properties_to_check = [
         'session_id=uuid.uuid4',  # New unique ID
         'workspace=session.workspace',
-        'model=session.model',
-        'model_provider=session.model_provider',
+        'model=destination_model',
+        'model_provider=destination_provider',
     ]
 
     for prop in properties_to_check:
@@ -236,7 +250,8 @@ def test_duplicate_session_copies_all_session_properties():
 
     # `messages` accepts either the plain assignment or the deepcopy form (May 2 2026 fix).
     assert 'messages=session.messages' in construction_block or \
-           'messages=copy.deepcopy(session.messages)' in construction_block, \
+           'messages=copy.deepcopy(session.messages)' in construction_block or \
+           'messages=copy.deepcopy(copy_messages)' in construction_block, \
         f"messages must be copied (plain or deepcopy form). Got: {construction_block[:300]}"
 
 
@@ -257,9 +272,13 @@ def test_duplicate_uses_deepcopy_for_messages():
     duplicate_start = content.find('if parsed.path == "/api/session/duplicate":')
     assert duplicate_start != -1, "Duplicate endpoint not found"
     lines = content[duplicate_start:].split('\n')
-    endpoint_code = '\n'.join(lines[:100])
-    assert 'copy.deepcopy(session.messages)' in endpoint_code, \
-        "duplicate must use copy.deepcopy(session.messages) — plain assignment shares list refs"
+    helper_start = content.find('def _clone_webui_session(')
+    assert helper_start != -1, 'Clone helper not found'
+    endpoint_code = content[helper_start:content.find('\n\ndef _persist_cloned_session', helper_start)]
+    assert ('copy.deepcopy(session.messages)' in endpoint_code or
+            ('copy_messages = session.messages' in endpoint_code and
+             'messages=copy.deepcopy(copy_messages)' in endpoint_code)), \
+        "duplicate must deep-copy its source messages — plain assignment shares list refs"
     assert 'copy.deepcopy(session.tool_calls)' in endpoint_code, \
         "duplicate must use copy.deepcopy(session.tool_calls) — plain assignment shares list refs"
 
@@ -276,9 +295,13 @@ def test_duplicate_explicitly_persists_to_disk():
         content = f.read()
     duplicate_start = content.find('if parsed.path == "/api/session/duplicate":')
     assert duplicate_start != -1, "Duplicate endpoint not found"
-    lines = content[duplicate_start:].split('\n')
-    endpoint_code = '\n'.join(lines[:100])
-    assert 'copied_session.save()' in endpoint_code, \
+    # Inspect the complete handler: guards/rebasing may grow without moving
+    # persistence into a different route. Do not borrow a later route's save.
+    helper_start = content.find('def _clone_webui_session(')
+    assert helper_start != -1, 'Clone helper not found'
+    persist_start = content.find('def _persist_cloned_session(', helper_start)
+    persist_code = content[persist_start:content.find('\n\n_ANCHOR_ACTIVITY', persist_start)]
+    assert 'session.save()' in persist_code, \
         "duplicate must call .save() explicitly — without it the copy vanishes on refresh"
 
 
@@ -294,7 +317,9 @@ def test_duplicate_resets_pinned_and_archived():
     duplicate_start = content.find('if parsed.path == "/api/session/duplicate":')
     assert duplicate_start != -1, "Duplicate endpoint not found"
     lines = content[duplicate_start:].split('\n')
-    endpoint_code = '\n'.join(lines[:100])
+    helper_start = content.find('def _clone_webui_session(')
+    assert helper_start != -1, 'Clone helper not found'
+    endpoint_code = content[helper_start:content.find('\n\ndef _persist_cloned_session', helper_start)]
     # Both must be hard-coded to False, NOT inherited from `session.pinned`/`session.archived`
     assert 'pinned=False' in endpoint_code, \
         "duplicate must reset pinned=False — duplicating shouldn't propagate pin state"
@@ -318,7 +343,9 @@ def test_duplicate_returns_404_when_session_not_found():
     duplicate_start = content.find('if parsed.path == "/api/session/duplicate":')
     assert duplicate_start != -1, "Duplicate endpoint not found"
     lines = content[duplicate_start:].split('\n')
-    endpoint_code = '\n'.join(lines[:100])
+    helper_start = content.find('def _clone_webui_session(')
+    assert helper_start != -1, 'Clone helper not found'
+    endpoint_code = content[duplicate_start:].split('\n    if parsed.path', 1)[0]
     assert 'bad(handler, "Session not found", status=404)' in endpoint_code, \
         "missing session must return status=404, not the default 400"
 

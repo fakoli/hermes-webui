@@ -15,15 +15,13 @@ import re
 
 
 def _extract_duplicate_block():
-    """Extract the duplicate handler block from routes.py."""
+    """Extract the clone implementation used by the duplicate handler."""
     with open('api/routes.py') as f:
         src = f.read()
-    match = re.search(
-        r'parsed\.path == "/api/session/duplicate"(.*?)(?=\n    if parsed\.path|$)',
-        src, re.DOTALL
-    )
-    assert match, "Could not find /api/session/duplicate handler block"
-    return match.group(1), src
+    start = src.find('def _clone_webui_session(')
+    end = src.find('\n\ndef _persist_cloned_session', start)
+    assert start != -1 and end != -1, "Could not find duplicate clone implementation"
+    return src[start:end], src
 
 
 def _extract_branch_block():
@@ -38,13 +36,14 @@ def _extract_branch_block():
     return match.group(1), src
 
 
-def _find_session_ctor(block, var_name='copied_session'):
+def _find_session_ctor(block, var_name='copied'):
     """Find the Session() constructor call in a block and return its body."""
-    # Match from "var_name = Session(" to the closing ")"
-    pattern = rf'{var_name}\s*=\s*Session\((.*?)\)\s*$'
-    match = re.search(pattern, block, re.DOTALL)
-    assert match, f"Could not find {var_name} = Session() constructor"
-    return match.group(1)
+    start = block.find(f'{var_name} = Session(')
+    end = block.find('\n        with LOCK:', start)
+    if end < 0:
+        end = block.find('\n    # Reconciliation', start)
+    assert start != -1 and end != -1, f"Could not find {var_name} = Session() constructor"
+    return block[start:end]
 
 
 def _has_field(ctor_body, field_name):
@@ -54,12 +53,8 @@ def _has_field(ctor_body, field_name):
 
 def _has_deepcopy_for(ctor_body, field_name):
     """Check if a field uses deepcopy in the constructor."""
-    # Find the line containing the field assignment
-    lines = ctor_body.split('\n')
-    for line in lines:
-        if f'{field_name}=' in line:
-            return 'deepcopy' in line
-    return False
+    start = ctor_body.find(f'{field_name}=')
+    return start >= 0 and 'deepcopy' in ctor_body[start:start + 240]
 
 
 # ── Duplicate: critical fields MUST be copied ────────────────────────────────
@@ -274,22 +269,21 @@ def test_duplicate_resets_archived():
         "Duplicate should reset archived to False"
 
 
-def test_duplicate_does_not_copy_compression_anchor():
-    """Compression anchor fields are intentionally NOT carried — they
-    re-derive on the next turn (per existing comment)."""
+def test_duplicate_copies_compression_anchor():
+    """A stable duplicate preserves durable compression-anchor state."""
     block, _ = _extract_duplicate_block()
     ctor = _find_session_ctor(block)
-    assert not _has_field(ctor, 'compression_anchor_visible_idx'), \
+    assert _has_field(ctor, 'compression_anchor_visible_idx'), \
         "compression_anchor_visible_idx should NOT be copied (re-derives)"
-    assert not _has_field(ctor, 'compression_anchor_message_key'), \
+    assert _has_field(ctor, 'compression_anchor_message_key'), \
         "compression_anchor_message_key should NOT be copied (re-derives)"
-    assert not _has_field(ctor, 'compression_anchor_summary'), \
+    assert _has_field(ctor, 'compression_anchor_summary'), \
         "compression_anchor_summary should NOT be copied (re-derives)"
-    assert not _has_field(ctor, 'compression_anchor_details'), \
+    assert _has_field(ctor, 'compression_anchor_details'), \
         "compression_anchor_details should NOT be copied (re-derives)"
-    assert not _has_field(ctor, 'compression_anchor_mode'), \
+    assert _has_field(ctor, 'compression_anchor_mode'), \
         "compression_anchor_mode should NOT be copied (re-derives)"
-    assert not _has_field(ctor, 'compression_anchor_engine'), \
+    assert _has_field(ctor, 'compression_anchor_engine'), \
         "compression_anchor_engine should NOT be copied (re-derives)"
 
 

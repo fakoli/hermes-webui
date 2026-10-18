@@ -11,6 +11,7 @@ import difflib
 import logging
 import os
 import shutil
+import stat as _stat
 import subprocess
 import tempfile
 import threading
@@ -20,7 +21,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from api.subprocess_utils import windows_hide_flags
+from api.subprocess_utils import (
+    clean_git_env,
+    noninteractive_git_env,
+    noninteractive_git_argv,
+    repository_git_proxy_blocks,
+    trusted_git_credential_config,
+    windows_hide_flags,
+)
 from api.workspace import rmtree_anchored, safe_resolve_ws, unlink_anchored
 
 logger = logging.getLogger(__name__)
@@ -32,35 +40,12 @@ STATUS_FILE_LIMIT = 500
 DIFF_SIZE_LIMIT = 512 * 1024
 COMMIT_MESSAGE_DIFF_LIMIT = 64 * 1024
 WORKSPACE_GIT_DESTRUCTIVE_ENV = "HERMES_WEBUI_WORKSPACE_GIT_DESTRUCTIVE"
-_GIT_ENV_SCRUB_KEYS = (
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_SYSTEM",
-    "GIT_CONFIG_COUNT",
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_ASKPASS",
-    "SSH_ASKPASS",
-    "GIT_SSH",
-    "GIT_SSH_COMMAND",
-)
-_GIT_ENV_SCRUB_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
 _HERMES_BRANCH_SWITCH_STASH_PREFIX = "hermes-webui branch switch"
 _GIT_HARDENED_CONFIG = (
     # Workspace Git operations can run against repositories provided by agents,
     # restored sessions, or mounted workspaces. Keep repo-local configuration
     # from turning read/status/fetch calls into host command execution.
     ("core.fsmonitor", "false"),
-    # Force the unmodified system ssh binary rather than clearing it — an empty
-    # value would break legitimate ssh fetches, while "ssh" overrides any
-    # repo-local core.sshCommand that points at an attacker helper.
-    ("core.sshCommand", "ssh"),
-    ("core.askPass", ""),
-    ("credential.helper", ""),
-    ("protocol.ext.allow", "never"),
-    # Neutralize repo-local core.gitProxy, which specifies an external proxy
-    # command reachable on `git fetch` against a git:// remote.
-    ("core.gitProxy", ""),
     # Prevent submodule operations from recursing into nested repos, which
     # could trigger hooks or fetch from attacker-controlled submodule URLs.
     ("submodule.recurse", "false"),
@@ -82,11 +67,12 @@ _GIT_DESTRUCTIVE_HARDENED_CONFIG = (
 def _hardened_git_argv(
     args: list[str],
     *,
+    credential_config: tuple[tuple[str, str], ...] = (),
     destructive: bool = False,
     attributes_file: str | None = None,
     hooks_path: str | None = None,
 ) -> list[str]:
-    argv = ["git"]
+    argv = noninteractive_git_argv([], credential_config=credential_config)
     for key, value in _GIT_HARDENED_CONFIG:
         argv.extend(["-c", f"{key}={value}"])
     if destructive:
@@ -110,16 +96,7 @@ def workspace_git_destructive_enabled() -> bool:
 
 
 def _clean_git_env(extra: dict[str, str] | None = None) -> dict[str, str]:
-    env = os.environ.copy()
-    if extra:
-        env.update(extra)
-    for key in _GIT_ENV_SCRUB_KEYS:
-        env.pop(key, None)
-    for key in list(env):
-        if key.startswith(_GIT_ENV_SCRUB_PREFIXES):
-            env.pop(key, None)
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    return env
+    return clean_git_env(extra)
 
 
 class GitWorkspaceError(RuntimeError):
@@ -168,7 +145,17 @@ def _classify_git_error(message: str, args: list[str] | None = None) -> str:
         return "not_a_repo"
     if "outside the workspace" in text or "outside the git repository" in text:
         return "path_outside_workspace"
-    if "authentication failed" in text or "permission denied" in text or "could not read username" in text:
+    if (
+        "authentication failed" in text
+        or "permission denied" in text
+        or "could not read username" in text
+        or "unable to get password from user" in text
+        # Git Credential Manager on Windows refuses to prompt when interaction is
+        # disabled (GCM_INTERACTIVE=never / credential.interactive=false): git then
+        # reports "Cannot prompt because user interactivity has been disabled."
+        # That is still an authentication failure, not a generic git failure.
+        or "cannot prompt because user interactivity has been disabled" in text
+    ):
         return "auth_failed"
     if "no upstream" in text or "no configured push destination" in text or "has no upstream branch" in text:
         return "no_upstream"
@@ -206,6 +193,15 @@ def _run_git(
 ) -> subprocess.CompletedProcess[str]:
     cwd = ctx_or_cwd.repo_root if isinstance(ctx_or_cwd, GitContext) else ctx_or_cwd
     run_env = _clean_git_env(env)
+    if repository_git_proxy_blocks(args, cwd, run_env):
+        raise GitWorkspaceError(
+            "Repository-configured core.gitProxy is not allowed for git:// remotes",
+            "unsafe_git_config",
+        )
+    credential_config = ()
+    if args and args[0] in {"fetch", "pull", "push", "ls-remote"}:
+        credential_config = trusted_git_credential_config(cwd, run_env)
+        run_env = noninteractive_git_env(cwd, run_env, args=args)
     effective_destructive = destructive and workspace_git_destructive_enabled()
     hardened_destructive_path = effective_destructive or force_destructive_hardening
     attributes_file = None
@@ -239,6 +235,7 @@ def _run_git(
         result = subprocess.run(
             _hardened_git_argv(
                 args,
+                credential_config=credential_config,
                 destructive=hardened_destructive_path,
                 attributes_file=attributes_file,
                 hooks_path=hooks_path,
@@ -551,6 +548,39 @@ def _parse_path_list(text: str, ctx: GitContext) -> set[str]:
     return paths
 
 
+def _is_crlf_only_status_noise(ctx: GitContext, workspace_path: str, *, cached: bool) -> bool:
+    """Classify a bounded, regular worktree CRLF-only status change."""
+    if cached:
+        # Filtered staged diffs already report actual content changes. Avoid a
+        # text-mode blob reread, which cannot reliably retain CRLF bytes.
+        return False
+    fd: int | None = None
+    try:
+        repo_path = _repo_rel(ctx, workspace_path)
+        path = ctx.workspace / workspace_path
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        file_stat = os.fstat(fd)
+        if not _stat.S_ISREG(file_stat.st_mode) or file_stat.st_size > DIFF_SIZE_LIMIT:
+            return False
+        indexed = _run_git(ctx, ["show", f":{repo_path}"], check=False,
+                           neutralize_filter_programs=True)
+        if indexed.returncode:
+            return False
+        # Read from the checked descriptor, never by path. The extra byte
+        # prevents an inode that grows during the read from bypassing the cap.
+        worktree = os.read(fd, DIFF_SIZE_LIMIT + 1)
+        if len(worktree) > DIFF_SIZE_LIMIT:
+            return False
+        right = worktree.decode("utf-8")
+    except (GitWorkspaceError, OSError, UnicodeDecodeError):
+        return False
+    finally:
+        if fd is not None:
+            os.close(fd)
+    left = indexed.stdout
+    return left != right and "\r\n" in right and left.replace("\r\n", "\n") == right.replace("\r\n", "\n")
+
+
 def _collect_diff_paths(ctx: GitContext, cached: bool, *, ignore_cr_at_eol: bool = True) -> set[str] | None:
     args = ["diff", "--name-only", "-z"]
     args.append("--no-textconv")
@@ -741,7 +771,7 @@ def git_status(workspace: str | Path) -> dict:
             if raw_staged and not staged:
                 if workspace_path in staged_raw_stats or (
                     old_workspace_path is not None and old_workspace_path in staged_raw_stats
-                ):
+                ) or _is_crlf_only_status_noise(ctx, workspace_path, cached=True):
                     filtered_noise["crlf_only"] += 1
                 else:
                     filtered_noise["filemode_only"] += 1
@@ -753,7 +783,7 @@ def git_status(workspace: str | Path) -> dict:
             if raw_unstaged and not unstaged:
                 if workspace_path in unstaged_raw_stats or (
                     old_workspace_path is not None and old_workspace_path in unstaged_raw_stats
-                ):
+                ) or _is_crlf_only_status_noise(ctx, workspace_path, cached=False):
                     filtered_noise["crlf_only"] += 1
                 else:
                     filtered_noise["filemode_only"] += 1

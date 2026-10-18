@@ -275,3 +275,19 @@ def test_ctl_status_survives_readonly_env_vars(tmp_path: Path):
     assert res.returncode == 0, res.stderr
     assert "hermes-webui" in res.stdout
     assert "readonly variable" not in res.stderr
+
+
+def test_curl56_requires_complete_health_document():
+    partial = subprocess.run(
+        ["bash", "-c", f'''. {HEALTH_PROBE}; curl() {{ printf '%s' '{{"status":"o'; return 56; }}; _hermes_webui_curl_get http://127.0.0.1/health'''],
+        capture_output=True, text=True,
+    )
+    assert partial.returncode == 56
+    assert partial.stdout == '{"status":"o'
+
+    complete = subprocess.run(
+        ["bash", "-c", f'''. {HEALTH_PROBE}; curl() {{ printf '%s' '{{"status":"ok","active_streams":0,"accept_loop":true}}'; return 56; }}; _hermes_webui_curl_get http://127.0.0.1/health'''],
+        capture_output=True, text=True,
+    )
+    assert complete.returncode == 0
+    assert complete.stdout == '{"status":"ok","active_streams":0,"accept_loop":true}'

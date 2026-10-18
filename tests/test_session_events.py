@@ -35,13 +35,17 @@ def test_session_events_publish_for_minimal_sidebar_mutations():
             assert '_persist_generated_session_title(s, next_title, event_reason="session_title_regenerate")' in ROUTES
         elif reason == "session_import":
             assert f'publish_session_list_changed("{reason}")' in ROUTES, reason
+        elif reason == "session_duplicate":
+            assert '_persist_cloned_session(copied_session, reason="session_duplicate")' in ROUTES
         else:
             assert f'"{reason}",' in ROUTES, reason
 
     assert 'if worktree_info:\n            publish_session_list_changed(\n                "session_new",' in ROUTES
     assert "was_hidden_empty_session = _is_hidden_empty_session(s)" in ROUTES
     assert 'if was_hidden_empty_session:\n        publish_session_list_changed(\n            "session_new",' in ROUTES
-    assert 'publish_session_list_changed(\n                "session_duplicate",' in ROUTES
+    assert 'def _persist_cloned_session(' in ROUTES
+    assert '_publish_session_list_changed(' in ROUTES
+    assert '_persist_cloned_session(copied_session, reason="session_duplicate")' in ROUTES
     assert 'publish_session_list_changed(\n            "session_rename",' in ROUTES
     assert '_persist_generated_session_title(s, next_title, event_reason="session_title_regenerate")' in ROUTES
     assert "session_id=sid" in ROUTES
