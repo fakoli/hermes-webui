@@ -10949,8 +10949,8 @@ def _is_messaging_session_id(sid: str) -> bool:
 def _session_sort_timestamp(session: dict) -> float:
     return float(
         _safe_first(
-            session.get("last_message_at"),
             session.get("updated_at"),
+            session.get("last_message_at"),
             session.get("created_at"),
             session.get("started_at"),
             0,
