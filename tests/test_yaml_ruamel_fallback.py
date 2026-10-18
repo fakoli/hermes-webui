@@ -180,4 +180,4 @@ def test_bootstrap_probe_accepts_ruamel_only():
 def test_ruamel_parse_error_is_narrow_and_catchable(ruamel_compat):
     assert ruamel_compat.YAMLError is not Exception
     with pytest.raises(ruamel_compat.YAMLError):
-        ruamel_compat.safe_load("broken: [")\n
+        ruamel_compat.safe_load("broken: [")
