@@ -196,6 +196,36 @@ def test_overlay_fails_closed_when_routes_unavailable(monkeypatch):
     assert rows[0]["cron_running"] is False
 
 
+def test_overlay_keeps_idle_rows_in_updated_at_order(monkeypatch):
+    """The runtime overlay must not undo the API payload's durable ordering."""
+    import api.route_session_list_cache as slc
+
+    monkeypatch.setattr(slc, "_session_list_cache_active_stream_ids", lambda: set())
+    monkeypatch.setattr(slc, "_session_list_cache_running_cron_jobs", lambda: {})
+
+    rows = slc._session_list_cache_overlay_runtime_rows(
+        [
+            _cron_row(
+                "idle-newer-update",
+                created_at=10,
+                updated_at=300,
+                last_message_at=100,
+            ),
+            _cron_row(
+                "idle-older-update",
+                created_at=20,
+                updated_at=200,
+                last_message_at=200,
+            ),
+        ]
+    )
+
+    assert [row["session_id"] for row in rows] == [
+        "idle-newer-update",
+        "idle-older-update",
+    ]
+
+
 def test_overlay_nested_job_prefixes_do_not_cross_claim(monkeypatch):
     """Overlapping cron job ids (backup vs backup_full) must not cross-claim.
 

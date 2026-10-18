@@ -755,13 +755,14 @@ def _session_list_row_numeric_value(value) -> float:
 def _session_list_row_timestamp(row: dict) -> float:
     if not isinstance(row, dict):
         return 0.0
-    # Match the frontend `_sessionSortTimestampMs` semantics exactly (#4688 review):
-    # the idle base is the FIRST truthy of last_message_at -> updated_at -> created_at
-    # (NOT a flat max over all of them — a renamed/metadata-touched idle chat bumps
-    # updated_at without new messages and must not outrank a newer chatted session),
-    # then pending_started_at is overlaid only as the runtime promotion.
+    # The API contract orders its cached session rows by their last durable
+    # update.  Keep the runtime overlay on that same basis: otherwise an idle
+    # row whose metadata changed after its last message can be moved behind an
+    # older row after the cache payload was already ordered by ``updated_at``.
+    # ``last_message_at`` and ``created_at`` remain fallbacks for older rows.
+    # Pending work is still a runtime-only promotion.
     base = 0.0
-    for key in ("last_message_at", "updated_at", "created_at"):
+    for key in ("updated_at", "last_message_at", "created_at"):
         base = _session_list_row_numeric_value(row.get(key))
         if base > 0:
             break
