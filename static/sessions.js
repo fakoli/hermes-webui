@@ -2110,8 +2110,8 @@ async function newSession(flash, options={}){
     if(consumedExplicitModelOverride&&typeof _clearEmptyComposerModelOverride==='function'){
       _clearEmptyComposerModelOverride();
     }
-    S.session=data.session;if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(data.session);S.messages=data.session.messages||[];
     S._pendingSessionToolsets=null;
+    S.session=data.session;if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(data.session);S.messages=data.session.messages||[];
     if(_sessionSourceFilter==='cli') _sessionSourceFilter='webui';
     if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(S.session);
     S.lastUsage={...(data.session.last_usage||{})};
@@ -2617,12 +2617,12 @@ async function loadSession(sid){
     return loadSession(continuationSid,{...opts,_continuationParentSid:sid,skipLineageResolve:true,skipContinuationResolve:true,force:true,_preloadNotified:true});
   }
   S.session=data.session;
-  if(typeof _refreshLocationChip==='function') _refreshLocationChip();
-  if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(data.session);
-  if(typeof _clearEmptyComposerModelOverride==='function') _clearEmptyComposerModelOverride();
   // Loading a real existing session abandons any pre-session toolset override
   // staged on the empty composer before any deferred refresh work runs.
   S._pendingSessionToolsets=null;
+  if(typeof _refreshLocationChip==='function') _refreshLocationChip();
+  if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(data.session);
+  if(typeof _clearEmptyComposerModelOverride==='function') _clearEmptyComposerModelOverride();
   if(typeof populateModelDropdown==='function'){
     const modelRefreshSid=sid;
     const isActiveModelRefreshSession=()=>!!(S.session&&S.session.session_id===modelRefreshSid);
@@ -5719,6 +5719,106 @@ function _appendSessionDuplicateAction(menu, session){
   ));
 }
 
+function _sessionProfileOptionLabel(profile){
+  const name=String(profile&&profile.name||'');
+  const model=String(profile&&profile.model||'').trim();
+  const provider=String(profile&&profile.provider||'').trim();
+  const lane=[provider,model].filter(Boolean).join(' / ');
+  return lane?`${name} — ${lane}`:name;
+}
+
+async function _openTransferredProfileSession(profile, sessionId){
+  if(typeof switchToProfile!=='function') throw new Error(t('session_profile_switch_unavailable'));
+  _profileSwitchOpeningExistingSession=true;
+  try{
+    await switchToProfile(profile);
+  }finally{
+    _profileSwitchOpeningExistingSession=false;
+  }
+  await loadSession(sessionId,{force:true,skipProfileResolve:true});
+  await renderSessionList();
+}
+
+async function _transferSessionToProfile(session, mode){
+  if(!session||!session.session_id) return;
+  const sourceProfile=String(session.profile||'default');
+  try{
+    const data=await api('/api/profiles');
+    const profiles=Array.isArray(data&&data.profiles)?data.profiles:[];
+    const destinations=profiles.filter(profile=>{
+      if(!profile||profile.visible===false) return false;
+      const name=String(profile.name||'');
+      return name && name!==sourceProfile;
+    });
+    if(!destinations.length){
+      showToast(t('session_profile_no_destinations'),3000,'error');
+      return;
+    }
+
+    const isMove=mode==='move';
+    const destination=await showSelectDialog({
+      title:isMove?t('session_move_profile_title'):t('session_clone_profile_title'),
+      message:t('session_profile_select_message',session.title||t('untitled')),
+      confirmLabel:isMove?t('session_move_profile_confirm'):t('session_clone_profile_confirm'),
+      options:destinations.map(profile=>({
+        value:String(profile.name||''),
+        label:_sessionProfileOptionLabel(profile),
+      })),
+    });
+    if(!destination) return;
+
+    // An action from the aggregate "All profiles" view may target a row that
+    // is not owned by the current profile cookie. Switch only after the user
+    // confirms (Cancel must be side-effect free), keeping the backend's normal
+    // session-ownership guard intact.
+    if(!_profileMatchesActiveProfile(sourceProfile,S.activeProfile||'default')){
+      _profileSwitchOpeningExistingSession=true;
+      try{await switchToProfile(sourceProfile);}
+      finally{_profileSwitchOpeningExistingSession=false;}
+    }
+
+    const response=await api('/api/session/profile-transfer',{
+      method:'POST',
+      body:JSON.stringify({
+        session_id:session.session_id,
+        destination_profile:destination,
+        mode,
+      }),
+    });
+    if(!response||!response.session) throw new Error(t('session_profile_transfer_empty_response'));
+    await _openTransferredProfileSession(destination,response.session.session_id);
+    showToast(
+      isMove?t('session_move_profile_success',destination):t('session_clone_profile_success',destination),
+      3000,
+      'success'
+    );
+  }catch(err){
+    showToast(t('session_profile_transfer_failed')+(err&&err.message?err.message:String(err||'')),4000,'error');
+  }
+}
+
+function _appendSessionProfileTransferActions(menu, session){
+  if(!session) return;
+  menu.appendChild(_buildSessionAction(
+    t('session_move_profile'),
+    t('session_move_profile_desc'),
+    ICONS.folder,
+    async()=>{
+      closeSessionActionMenu();
+      await _transferSessionToProfile(session,'move');
+    }
+  ));
+  menu.appendChild(_buildSessionAction(
+    t('session_clone_profile'),
+    t('session_clone_profile_desc'),
+    ICONS.dup,
+    async()=>{
+      closeSessionActionMenu();
+      await _transferSessionToProfile(session,'clone');
+    }
+  ));
+}
+
 function _appendSessionExportHtmlAction(menu, session){
   // Per-conversation "Export as HTML" — the sidebar ⋮ menu is the app's uniform
   // home for per-conversation actions (matches ChatGPT / Open WebUI). Operates
@@ -5859,6 +5959,9 @@ function _openSessionActionMenu(session, anchorEl){
       _showProjectPicker(session, anchorEl);
     }
   ));
+  if(!isExternalSession){
+    _appendSessionProfileTransferActions(menu, session);
+  }
   menu.appendChild(_buildSessionAction(
     session.archived?t('session_restore'):t('session_archive'),
     session.archived?t('session_restore_desc'):_sessionArchiveDescription(session),

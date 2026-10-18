@@ -3712,6 +3712,13 @@ def _raw_provider_record_enabled(record: object) -> bool:
 # ``_entry_url``'s precedence in hermes_cli.runtime_provider_custom.
 _RAW_PROVIDER_URL_FIELDS = ("api", "url", "base_url")
 
+# Sentinel returned by _resolve_model_alias_for_reasoning when a model id is a
+# configured self-hosted alias slot (e.g. Anvil's "llm.primary"). The physical
+# model behind the slot is not exposed, so capability detection can't run on
+# it; the operator explicitly aliased the slot, so the composer should treat
+# it as reasoning-capable (full effort ladder + thinking toggle).
+_ALIAS_SLOT_REASONING_MARKER = object()
+
 
 def _normalized_raw_provider_record(record: dict, ep_name: str) -> dict:
     """Return ``record`` respelled in the field names this module's readers use.
@@ -5772,6 +5779,181 @@ def _configured_reasoning_effort_lists(provider_entry, model_id: str) -> list:
     return configured_lists
 
 
+def _is_opaque_router_slot_id(model_id: str) -> bool:
+    """True when a model id looks like an opaque self-hosted router slot.
+
+    Self-hosted gateways (Anvil, one-api, new-api, TabbyAPI, vLLM proxies)
+    expose models under names that are *not* real model identifiers but slot
+    positions or vendor-neutral route names — e.g. ``llm.primary``,
+    ``llm.secondary``, ``vision.general``, ``voice``, ``v3``, ``slot-7``.
+    These carry no family/version token that the reasoning heuristics can
+    recognize, yet the operator has pointed them at reasoning-capable hardware.
+
+    The heuristic here is deliberately narrow so ordinary model names
+    (``gpt-5.6``, ``deepseek-v4-flash``, ``inkling``) are NEVER classified as
+    slots — those must keep flowing through the normal config/heuristic
+    pipeline:
+
+      * a dotted name whose first segment is one of the known router slot
+        prefixes (``llm.``, ``vision.``, ``voice``, ``audio``, ``embed``,
+        ``image``) — Anvil's own slot vocabulary;
+      * OR a bare name with no dots/slashes/version digits that equals a
+        segment from that vocabulary (``voice``, ``ocr``, ``general``, …).
+    """
+    name = str(model_id or "").strip().lower()
+    if not name:
+        return False
+    # Normalize "v3" / "slot-7" style names too.
+    bare = name.rsplit("/", 1)[-1].lstrip("@").split(":", 1)[-1]
+    first = bare.split(".", 1)[0]
+
+    _SLOT_PREFIXES = {
+        "llm",
+        "vision",
+        "voice",
+        "audio",
+        "embed",
+        "embedding",
+        "image",
+        "img",
+        "slot",
+    }
+    if "." in bare and first in _SLOT_PREFIXES:
+        return True
+    if (
+        "." not in bare
+        and "-" not in bare
+        and "_" not in bare
+        and not any(ch.isdigit() for ch in bare)
+        and bare in _SLOT_PREFIXES | {"general", "ocr", "primary", "secondary", "main"}
+    ):
+        return True
+    return False
+
+
+def _resolve_model_alias_for_reasoning(
+    model_id: str,
+    *,
+    provider_id: str | None = None,
+    base_url: str | None = None,
+) -> str:
+    """Best-effort alias chain resolution for reasoning capability checks.
+
+    Self-hosted gateways (Anvil, custom relay/proxy configs) frequently expose
+    opaque slot ids such as ``llm.primary`` / ``llm.secondary`` that are
+    configured via ``model.aliases`` in two directions:
+
+      * alias keys: ``primary: anvil/llm.primary``
+      * alias values: the *target* ``anvil/llm.primary`` (a slot id) is itself
+        aliased to the physical router model.
+
+    The reasoning resolver's string heuristics have no way to recognize those
+    opaque ids, so the composer's thinking/effort chip silently stays hidden
+    even though the underlying model reasons fine.
+
+    Resolution strategy, all best-effort:
+
+    1. If the id is a configured alias KEY, follow it to its value.
+    2. If the id matches an alias VALUE (modulo provider prefix), treat the
+       bare trailing slot id (``llm.primary``) as that alias target — it is an
+       opaque router slot, and aliasing it means the operator routes
+       reasoning-capable hardware through it.
+    3. Cap the chain walk at 4 hops to bound any cyclic alias config.
+
+    Returns the caller's original id when nothing matches, so the existing
+    heuristics still run unchanged for every non-aliased model.
+
+    Anchored, key-based matching (not ``in`` substring checks) keeps a model
+    named ``llm.primary-small`` or ``my-llm.secondary-copy`` from being
+    silently hijacked by the aliases table.
+    """
+    model = str(model_id or "").strip()
+    if not model:
+        return model
+
+    try:
+        aliases = _model_aliases_from_config()
+    except Exception:
+        aliases = {}
+
+    def _slot_of(value: str) -> str:
+        # "anvil/llm.primary" -> "llm.primary"; "@anvil:llm.primary" same.
+        return str(_strip_provider_hint_for_reasoning(value)).strip("/")
+
+    # The alias-table VALUE form is what actually appears in model ids the UI
+    # sends ("llm.primary" as a bare slot, "anvil/llm.primary" slash-prefixed,
+    # "@anvil:llm.primary" hint-prefixed). Store the raw value AND its slot
+    # form so every spelling matches.
+    alias_values = {str(v).strip() for v in aliases.values() if str(v).strip()}
+    alias_slot_targets = {_slot_of(str(v)) for v in aliases.values() if str(v).strip()}
+
+    # A model id can ALSO be the bare dotted slot id itself ("llm.primary"),
+    # which is how self-hosted routers (Anvil) name their slots in
+    # providers.<provider>.models / default_model. The aliases table only maps
+    # the short "primary" key -> the slot id, so recognize the slot-id -> alias
+    # direction too: if the id names a configured provider slot, it is a
+    # reasoning-capable opaque model behind the operator's router.
+    #
+    # SCOPED to opaque dotted slot shapes (llm.primary, llm.secondary,
+    # vision.general, voice, qwen-style router names). A plain model name like
+    # "gpt-5.6" or "inkling" keyed under providers.<p>.models must NOT trigger
+    # this path — those go through the normal heuristics / explicit config.
+    _provider_model_slots: set[str] = set()
+    _provider_default_model = ""
+    try:
+        _prov_cfg = (cfg.get("providers") or {}).get(provider_id or "", {})
+        if isinstance(_prov_cfg, dict):
+            _raw_models = _prov_cfg.get("models") or {}
+            if isinstance(_raw_models, dict):
+                _provider_model_slots = {
+                    str(k).strip()
+                    for k in _raw_models
+                    if str(k).strip() and _is_opaque_router_slot_id(str(k).strip())
+                }
+            _provider_default_model = str(
+                (_prov_cfg.get("default_model") or "").strip()
+            )
+    except Exception:
+        pass
+    if _provider_default_model and _is_opaque_router_slot_id(_provider_default_model):
+        _provider_model_slots.add(_provider_default_model)
+
+    candidate = model
+    for _ in range(4):
+        stripped = _strip_provider_hint_for_reasoning(candidate, provider_id)
+        if stripped in aliases:
+            resolved = str(aliases[stripped]).strip()
+            if not resolved or resolved == candidate:
+                break
+            candidate = resolved
+            continue
+        if (
+            candidate in alias_values
+            or stripped in alias_slot_targets
+            or stripped in _provider_model_slots
+        ):
+            # The slot id is a configured alias target OR names a configured
+            # self-hosted provider slot; keep it as-is (it is already the
+            # slotted form used against the gateway) and stop — there is no
+            # further key to follow.
+            break
+        break
+
+    # Marker for "this is a configured self-hosted alias slot". Self-hosted
+    # routers (Anvil, one-api, new-api, …) address their reasoning models by
+    # opaque slot ids that match NO heuristic token — the physical model is
+    # hidden behind the router. The operator has explicitly aliased this slot,
+    # so treat it as reasoning-capable and let the composer offer the effort
+    # ladder + thinking toggle.
+    stripped_final = _strip_provider_hint_for_reasoning(candidate, provider_id)
+    if candidate in alias_values or stripped_final in (
+        alias_slot_targets | _provider_model_slots
+    ):
+        return _ALIAS_SLOT_REASONING_MARKER
+
+    return candidate
+
+
 def _resolve_model_reasoning_efforts_impl(
     model_id: str | None = None,
     provider_id: str | None = None,
@@ -5781,6 +5963,22 @@ def _resolve_model_reasoning_efforts_impl(
     model = str(model_id or "").strip()
     if not model:
         return []
+
+    # Self-hosted gateways address models by opaque slot ids (llm.primary,
+    # llm.secondary, …) configured via model.aliases. Resolve the alias chain
+    # first so capability detection runs against a name the heuristics can
+    # recognize; non-aliased ids pass through unchanged (#0 / anvil-relay).
+    model = _resolve_model_alias_for_reasoning(
+        model,
+        provider_id=provider_id,
+        base_url=base_url,
+    )
+    if model is _ALIAS_SLOT_REASONING_MARKER:
+        # Opaque router slot the operator aliased: expose the full effort
+        # ladder and thinking toggle. The physical model is hidden behind the
+        # router, so the marker is the only signal we have — and an explicit
+        # alias is a strong signal the slot serves a reasoning-capable model.
+        return list(VALID_REASONING_EFFORTS)
 
     provider = str(provider_id or "").strip().lower() if provider_id else ""
     resolved_base_url = str(base_url or "").strip() or None

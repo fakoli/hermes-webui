@@ -11,6 +11,7 @@ import difflib
 import logging
 import os
 import shutil
+import stat as _stat
 import subprocess
 import tempfile
 import threading
@@ -547,6 +548,39 @@ def _parse_path_list(text: str, ctx: GitContext) -> set[str]:
     return paths
 
 
+def _is_crlf_only_status_noise(ctx: GitContext, workspace_path: str, *, cached: bool) -> bool:
+    """Classify a bounded, regular worktree CRLF-only status change."""
+    if cached:
+        # Filtered staged diffs already report actual content changes. Avoid a
+        # text-mode blob reread, which cannot reliably retain CRLF bytes.
+        return False
+    fd: int | None = None
+    try:
+        repo_path = _repo_rel(ctx, workspace_path)
+        path = ctx.workspace / workspace_path
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        file_stat = os.fstat(fd)
+        if not _stat.S_ISREG(file_stat.st_mode) or file_stat.st_size > DIFF_SIZE_LIMIT:
+            return False
+        indexed = _run_git(ctx, ["show", f":{repo_path}"], check=False,
+                           neutralize_filter_programs=True)
+        if indexed.returncode:
+            return False
+        # Read from the checked descriptor, never by path. The extra byte
+        # prevents an inode that grows during the read from bypassing the cap.
+        worktree = os.read(fd, DIFF_SIZE_LIMIT + 1)
+        if len(worktree) > DIFF_SIZE_LIMIT:
+            return False
+        right = worktree.decode("utf-8")
+    except (GitWorkspaceError, OSError, UnicodeDecodeError):
+        return False
+    finally:
+        if fd is not None:
+            os.close(fd)
+    left = indexed.stdout
+    return left != right and "\r\n" in right and left.replace("\r\n", "\n") == right.replace("\r\n", "\n")
+
+
 def _collect_diff_paths(ctx: GitContext, cached: bool, *, ignore_cr_at_eol: bool = True) -> set[str] | None:
     args = ["diff", "--name-only", "-z"]
     args.append("--no-textconv")
@@ -737,7 +771,7 @@ def git_status(workspace: str | Path) -> dict:
             if raw_staged and not staged:
                 if workspace_path in staged_raw_stats or (
                     old_workspace_path is not None and old_workspace_path in staged_raw_stats
-                ):
+                ) or _is_crlf_only_status_noise(ctx, workspace_path, cached=True):
                     filtered_noise["crlf_only"] += 1
                 else:
                     filtered_noise["filemode_only"] += 1
@@ -749,7 +783,7 @@ def git_status(workspace: str | Path) -> dict:
             if raw_unstaged and not unstaged:
                 if workspace_path in unstaged_raw_stats or (
                     old_workspace_path is not None and old_workspace_path in unstaged_raw_stats
-                ):
+                ) or _is_crlf_only_status_noise(ctx, workspace_path, cached=False):
                     filtered_noise["crlf_only"] += 1
                 else:
                     filtered_noise["filemode_only"] += 1

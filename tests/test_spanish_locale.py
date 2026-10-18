@@ -1,13 +1,9 @@
 from pathlib import Path
 import re
-from tests.test_issue2147_profile_concept_help import PROFILE_CONCEPT_KEYS
+from tests.test_issue2147_profile_concept_help import ENGLISH_FALLBACK_KEYS
 
 
 REPO = Path(__file__).resolve().parent.parent
-PROFILE_CONCEPT_FALLBACK_KEYS = {
-    *PROFILE_CONCEPT_KEYS,
-    "workspace_artifact_source_session",
-}
 
 
 def read(path: Path) -> str:
@@ -46,5 +42,5 @@ def test_spanish_locale_covers_english_keys():
     en_keys = set(key_pattern.findall(en_match.group(1)))
     es_keys = set(key_pattern.findall(es_match.group(1)))
 
-    missing = sorted((en_keys - es_keys) - PROFILE_CONCEPT_FALLBACK_KEYS)
+    missing = sorted((en_keys - es_keys) - ENGLISH_FALLBACK_KEYS)
     assert not missing, f"Spanish locale missing keys: {missing}"

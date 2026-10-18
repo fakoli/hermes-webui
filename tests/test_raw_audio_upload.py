@@ -171,7 +171,7 @@ def test_send_raw_audio_honors_explicit_pending_send():
     # audio even when the composer already has text.
     assert "if(window._micPendingSend){" in _BOOT_JS
     # and it lives inside _sendRawAudio (before the empty-composer fallback).
-    idx = _BOOT_JS.index("async function _sendRawAudio")
+    idx = _BOOT_JS.index("function _sendRawAudio")
     end = _BOOT_JS.index("function _commitTranscript", idx)
     body = _BOOT_JS[idx:end]
     assert "window._micPendingSend" in body and "send()" in body

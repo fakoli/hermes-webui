@@ -19,6 +19,32 @@ PROFILE_CONCEPT_KEYS = [
 ]
 
 
+# GUIDELINES section 8: new copy is owned by English until translated.
+ENGLISH_FALLBACK_KEYS = {
+    *PROFILE_CONCEPT_KEYS,
+    "workspace_artifact_source_session",
+    "composer_control_location",
+    "dialog_select_title",
+    "session_clone_profile",
+    "session_clone_profile_confirm",
+    "session_clone_profile_desc",
+    "session_clone_profile_success",
+    "session_clone_profile_title",
+    "session_move_profile",
+    "session_move_profile_confirm",
+    "session_move_profile_desc",
+    "session_move_profile_success",
+    "session_move_profile_title",
+    "session_profile_no_destinations",
+    "session_profile_select_message",
+    "session_profile_switch_unavailable",
+    "session_profile_transfer_empty_response",
+    "session_profile_transfer_failed",
+    "settings_desc_ask_location",
+    "settings_label_ask_location",
+}
+
+
 def _locale_blocks():
     """Extract every top-level locale block from static/i18n.js."""
     matches = list(re.finditer(r"^  ('[^']+'|[A-Za-z][A-Za-z0-9-]*): \{$", I18N_JS, re.MULTILINE))
@@ -82,3 +108,27 @@ def test_example_row_present():
     """The concept detail view must render an example row."""
     detail_body = _render_profile_concept_help_body()
     assert "t('profile_concept_example')" in detail_body
+
+
+def test_english_fallback_copy_resolves_in_every_locale():
+    """Execute the actual translator, including numbered placeholder expansion."""
+    import json
+    from tests.test_language_precedence import _run_i18n_case
+
+    result = _run_i18n_case("""(() => {
+      const keys = """ + json.dumps(sorted(ENGLISH_FALLBACK_KEYS)) + """;
+      const failures = [];
+      for (const lang of Object.keys(LOCALES)) {
+        setLocale(lang);
+        for (const key of keys) {
+          const translated = t(key, 'Example Profile');
+          if (typeof translated !== 'string' || !translated || translated === key
+              || translated.includes('{0}')) failures.push([lang, key]);
+        }
+      }
+      setLocale('zh');
+      return {failures, moved: t('session_move_profile_success', 'Example Profile'),
+              unknown: t('absent_test_key')};
+    })()""")
+    assert result == {"failures": [], "moved": "Moved conversation to Example Profile",
+                      "unknown": "absent_test_key"}
