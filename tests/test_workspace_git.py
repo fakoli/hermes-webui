@@ -2581,3 +2581,26 @@ def test_config_names_for_scope_passes_windows_hide_flags(monkeypatch, tmp_path)
     assert captured.get("creationflags") == windows_hide_flags(), (
         "_config_names_for_scope must pass creationflags=windows_hide_flags()"
     )
+
+
+def test_crlf_noise_classifier_keeps_checked_inode_when_path_is_swapped(tmp_path, monkeypatch):
+    """A workspace path replacement during Git lookup cannot redirect the read."""
+    import api.workspace_git as workspace_git
+
+    repo = _init_repo(tmp_path / "repo")
+    target = repo / "tracked.txt"
+    target.write_text("one\ntwo\n", encoding="utf-8", newline="\n")
+    _commit_all(repo)
+    target.write_text("one\r\ntwo\r\n", encoding="utf-8", newline="")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("not the checked inode\n", encoding="utf-8")
+    ctx = workspace_git.resolve_git_context(repo)
+    original = workspace_git._run_git
+
+    def swap_then_run(*args, **kwargs):
+        target.unlink()
+        target.symlink_to(outside)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(workspace_git, "_run_git", swap_then_run)
+    assert workspace_git._is_crlf_only_status_noise(ctx, "tracked.txt", cached=False) is True

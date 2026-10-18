@@ -18,6 +18,7 @@ Every case asserts BOTH directions:
 - the punctuation never enters href
 - the punctuation remains visible after the closing </a>
 """
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -75,13 +76,23 @@ eval(extractFunc('_isBacktickFenceClose'));
 eval(extractFunc('renderMd'));
 
 let buf = '';
+// Preserve a split UTF-8 CJK character across pipe chunks. Concatenating raw
+// Buffers coerces each chunk independently and can introduce U+FFFD at a
+// chunk boundary in large renderer inputs.
+process.stdin.setEncoding('utf8');
 process.stdin.on('data', c => { buf += c; });
 process.stdin.on('end', () => {
   const started = process.hrtime.bigint();
   const rendered = renderMd(buf);
   const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
-  process.stdout.write(rendered);
-  if (process.env.RENDER_TIMING === '1') process.stderr.write(String(elapsedMs));
+  const finish = () => {
+    if (process.env.RENDER_TIMING === '1') process.stderr.write(String(elapsedMs));
+  };
+  // stdout is a pipe in this harness. Respect write backpressure before
+  // emitting timing data or letting Node close, otherwise large rendered
+  // CJK URL batches can lose interior chunks nondeterministically.
+  if (!process.stdout.write(rendered)) process.stdout.once('drain', finish);
+  else finish();
 });
 """
 
@@ -116,7 +127,7 @@ def _render_timed(driver_path, markdown: str) -> tuple[str, float]:
         capture_output=True,
         text=True,
         timeout=30,
-        env={"PATH": str(Path(NODE).parent), "RENDER_TIMING": "1"},
+        env={**os.environ, "PATH": str(Path(NODE).parent), "RENDER_TIMING": "1"},
     )
     if result.returncode != 0:
         raise RuntimeError(f"node driver failed: {result.stderr}")

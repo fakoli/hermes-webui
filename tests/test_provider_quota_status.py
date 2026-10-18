@@ -1284,8 +1284,10 @@ def test_settings_label_and_description_i18n_keys_exist_for_all_locales():
     assert locale_count >= 1
     assert "settings_label_fade_text_effect" in keys
     assert "settings_desc_fade_text_effect" in keys
+    from tests.test_issue2147_profile_concept_help import ENGLISH_FALLBACK_KEYS
     for key in keys:
-        assert len(re.findall(rf"^\s+{re.escape(key)}:", i18n, re.MULTILINE)) == locale_count, key
+        expected = 1 if key in ENGLISH_FALLBACK_KEYS else locale_count
+        assert len(re.findall(rf"^\s+{re.escape(key)}:", i18n, re.MULTILINE)) == expected, key
 
 
 def test_provider_quota_styles_exist():

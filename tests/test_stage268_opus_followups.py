@@ -50,14 +50,10 @@ def test_sf1_session_meta_children_present_in_all_locales():
 # --- SF-2 (#1462): duplicate carries per-session settings ---
 
 def _duplicate_handler_block():
-    # Match the whole handler; an unrelated pre-construction guard must not
-    # move copied settings outside an arbitrary character-budget assertion.
-    match = re.search(
-        r'if parsed\.path == "/api/session/duplicate":.*?(?=\n    if parsed\.path|\Z)',
-        ROUTES_PY, re.DOTALL,
-    )
-    assert match, "Duplicate handler not found"
-    return match.group(0)
+    start = ROUTES_PY.find('def _clone_webui_session(')
+    end = ROUTES_PY.find('\n\ndef _persist_cloned_session', start)
+    assert start != -1 and end != -1, "Duplicate clone implementation not found"
+    return ROUTES_PY[start:end]
 
 
 
@@ -73,7 +69,7 @@ def test_sf2_duplicate_carries_personality():
 def test_sf2_duplicate_carries_enabled_toolsets():
     """The duplicate must propagate `enabled_toolsets` (per-session toolset overrides)."""
     block = _duplicate_handler_block()
-    assert 'enabled_toolsets=getattr(session, "enabled_toolsets", None)' in block, (
+    assert 'enabled_toolsets=copy.deepcopy(getattr(session, "enabled_toolsets", None))' in block, (
         "duplicate must carry enabled_toolsets — without it, per-session "
         "toolset overrides silently revert to defaults in the copy"
     )
@@ -82,8 +78,8 @@ def test_sf2_duplicate_carries_enabled_toolsets():
 def test_sf2_duplicate_carries_context_settings():
     """The duplicate must propagate context_length + threshold_tokens."""
     block = _duplicate_handler_block()
-    assert 'context_length=getattr(session, "context_length", None)' in block
-    assert 'threshold_tokens=getattr(session, "threshold_tokens", None)' in block
+    assert 'context_length=0 if cross_profile else getattr(session, "context_length", None)' in block
+    assert 'threshold_tokens=0 if cross_profile else getattr(session, "threshold_tokens", None)' in block
 
 
 # --- SF-3 (#1462): None-title fallback ---

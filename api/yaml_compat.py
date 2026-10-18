@@ -27,6 +27,17 @@ except ImportError:
     _pyyaml = None
     import ruamel.yaml  # noqa: F401  (neither backend -> ImportError, as a bare ``import yaml`` would)
 
+if _pyyaml is not None:
+    YAMLError = _pyyaml.YAMLError
+else:
+    try:
+        from ruamel.yaml.error import YAMLError
+    except ImportError:
+        # Minimal bootstrap stubs do not expose ruamel's error module. Keep a
+        # narrow compatibility exception so callers never mask unrelated bugs.
+        class YAMLError(Exception):
+            pass
+
 BACKEND = "pyyaml" if _pyyaml is not None else "ruamel"
 
 _YAML11 = (1, 1)

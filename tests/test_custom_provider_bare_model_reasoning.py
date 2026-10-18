@@ -303,3 +303,104 @@ def test_custom_nested_gemini_pre_2_5_routes_exclude_reasoning(model_id):
     ) == [], f"{model_id} (pre-2.5 Gemini) must not expose reasoning efforts"
 
 
+# ── self-hosted alias slots (Anvil et al.) ─────────────────────────────────────
+#
+# Self-hosted routers (Anvil, one-api, new-api, vLLM proxies) expose opaque
+# slot ids like "llm.primary" / "llm.secondary" configured through
+# model.aliases and providers.<p>.models. The reasoning resolver's string
+# heuristics can't recognize these, so the composer's thinking/effort chip used
+# to stay hidden. The operator explicitly routed reasoning-capable hardware
+# through the slot, so resolve_model_reasoning_efforts should treat it as
+# reasoning-capable (full effort ladder + thinking toggle).
+
+def test_anvil_slot_id_exposes_reasoning_efforts(monkeypatch):
+    """The exact Anvil-style config: provider slots + model.aliases."""
+    original_providers = cfg.cfg.get("providers")
+    monkeypatch.setitem(
+        cfg.cfg,
+        "providers",
+        {
+            "anvil": {
+                "api": "https://router.local/v1",
+                "models": {"llm.primary": {}, "llm.secondary": {}},
+            }
+        },
+    )
+    original_aliases = cfg.cfg.get("model", {}).get("aliases")
+    monkeypatch.setitem(
+        cfg.cfg,
+        "model",
+        {
+            **cfg.cfg.get("model", {}),
+            "aliases": {
+                "primary": "anvil/llm.primary",
+                "secondary": "anvil/llm.secondary",
+            },
+        },
+    )
+    try:
+        for slot in ("llm.primary", "llm.secondary", "anvil/llm.primary", "llm.primary"):
+            assert set(cfg.resolve_model_reasoning_efforts(slot, provider_id="anvil")) >= {
+                "low",
+                "medium",
+                "high",
+            }, f"{slot} should expose reasoning efforts (full ladder)"
+    finally:
+        if original_providers is None:
+            cfg.cfg.pop("providers", None)
+        else:
+            monkeypatch.setitem(cfg.cfg, "providers", original_providers)
+        if original_aliases is None:
+            cfg.cfg.get("model", {}).pop("aliases", None)
+        else:
+            monkeypatch.setitem(cfg.cfg, "model", cfg.cfg.get("model", {}))
+
+
+def test_anvil_slot_id_coercion_preserves_effort(monkeypatch):
+    """A stored effort must survive coercion for an aliased slot, and 'none'
+    must still turn thinking off."""
+    original_providers = cfg.cfg.get("providers")
+    monkeypatch.setitem(
+        cfg.cfg,
+        "providers",
+        {"anvil": {"api": "https://router.local/v1", "models": {"llm.primary": {}}}},
+    )
+    try:
+        assert cfg.coerce_reasoning_effort_for_model(
+            "high", "llm.primary", provider_id="anvil"
+        ) == "high"
+        assert cfg.coerce_reasoning_effort_for_model(
+            "max", "llm.primary", provider_id="anvil"
+        ) == "max"
+        assert cfg.coerce_reasoning_effort_for_model(
+            "none", "llm.primary", provider_id="anvil"
+        ) == "none"
+    finally:
+        if original_providers is None:
+            cfg.cfg.pop("providers", None)
+        else:
+            monkeypatch.setitem(cfg.cfg, "providers", original_providers)
+
+
+def test_plain_provider_model_keeps_heuristics_no_slot_marker(monkeypatch):
+    """A provider where models are ordinary names (NOT opaque slots) must NOT
+    be treated as a self-hosted slot — explicit reasoning_efforts config or
+    normal heuristics still win."""
+    original_providers = cfg.cfg.get("providers")
+    monkeypatch.setitem(
+        cfg.cfg,
+        "providers",
+        {"wandb": {"models": {"inkling": {}}}},
+    )
+    try:
+        # Not a dotted opaque slot → no marker → heuristics → empty for unknown.
+        assert cfg.resolve_model_reasoning_efforts(
+            "inkling", provider_id="wandb"
+        ) == []
+    finally:
+        if original_providers is None:
+            cfg.cfg.pop("providers", None)
+        else:
+            monkeypatch.setitem(cfg.cfg, "providers", original_providers)
+
+

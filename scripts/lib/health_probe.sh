@@ -58,6 +58,33 @@ _hermes_webui_warn_self_signed() {
     "$1" >&2
 }
 
+# curl 8/OpenSSL 3 can report exit 56 after receiving a complete HTTP/1.0
+# health response whose TLS peer closes without close_notify. Preserve curl's
+# normal failures, but accept that specific post-response condition only when
+# curl returned the complete expected health success document under -f.
+_hermes_webui_curl_get() {
+  local body rc
+  body="$(curl "$@" 2>/dev/null)"
+  rc=$?
+  printf '%s' "${body}"
+  # curl 56 is acceptable only after complete JSON whose top-level health
+  # status is ok; a reset after a partial arbitrary response remains a failure.
+  if [[ ${rc} -eq 0 ]]; then
+    return 0
+  fi
+  if [[ ${rc} -eq 56 ]] && python3 -c '
+import json, sys
+try:
+    value = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeDecodeError):
+    raise SystemExit(1)
+raise SystemExit(0 if isinstance(value, dict) and value.get("status") == "ok" else 1)
+' <<<"${body}"; then
+    return 0
+  fi
+  return "${rc}"
+}
+
 # _hermes_webui_http_get <url> <max_time> <mode> [direct]
 # mode: "insecure" disables certificate verification, anything else verifies.
 # direct: "direct" bypasses every configured proxy.
@@ -67,15 +94,15 @@ _hermes_webui_http_get() {
   if command -v curl >/dev/null 2>&1; then
     if [[ "${mode}" == "insecure" ]]; then
       if [[ "${direct}" == "direct" ]]; then
-        curl -fsS -k --noproxy '*' --max-time "${max_time}" "${url}" 2>/dev/null
+        _hermes_webui_curl_get -fsS -k --noproxy '*' --max-time "${max_time}" "${url}"
       else
-        curl -fsS -k --max-time "${max_time}" "${url}" 2>/dev/null
+        _hermes_webui_curl_get -fsS -k --max-time "${max_time}" "${url}"
       fi
     else
       if [[ "${direct}" == "direct" ]]; then
-        curl -fsS --noproxy '*' --max-time "${max_time}" "${url}" 2>/dev/null
+        _hermes_webui_curl_get -fsS --noproxy '*' --max-time "${max_time}" "${url}"
       else
-        curl -fsS --max-time "${max_time}" "${url}" 2>/dev/null
+        _hermes_webui_curl_get -fsS --max-time "${max_time}" "${url}"
       fi
     fi
     return $?
@@ -111,6 +138,12 @@ _hermes_webui_http_get() {
 hermes_webui_probe_health() {
   local host="$1" port="$2" path="${3:-/health}" max_time="${4:-2}" direct="${5:-}"
   local scheme body
+  # A loopback endpoint is never a proxy destination.  Some managed shells
+  # export a catch-all HTTPS proxy without NO_PROXY, which otherwise makes a
+  # local self-signed health check fail before it reaches the listener.
+  if [[ -z "${direct}" && ( "${host}" == "127.0.0.1" || "${host}" == "::1" ) ]]; then
+    direct="direct"
+  fi
   scheme="$(hermes_webui_probe_scheme)"
 
   local http_url="http://${host}:${port}${path}"

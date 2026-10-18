@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import uuid
+from api import yaml_compat as yaml
 import http.client
 import socket as _socket
 from collections import defaultdict, deque, OrderedDict
@@ -4256,6 +4257,173 @@ def _ensure_full_session_before_mutation(sid: str, session):
     return full_session
 
 
+def _session_profile_transfer_destination(
+    destination_profile: str,
+    source_profile: str | None,
+) -> tuple[str, str, str | None]:
+    """Resolve a cross-profile destination and its configured model lane."""
+    destination = str(destination_profile or "").strip()
+    if not destination:
+        raise ValueError("destination_profile is required")
+
+    profile_row = next(
+        (
+            row
+            for row in list_profiles_api()
+            if isinstance(row, dict) and str(row.get("name") or "") == destination
+        ),
+        None,
+    )
+    if _profiles_match(destination, source_profile or "default"):
+        raise ValueError("Destination profile must differ from the session profile")
+
+    # Resolve and verify the profile home directly instead of treating the
+    # short-lived listing as the existence authority.  The WebUI's protected
+    # profile resolver validates the logical name and containment; a freshly
+    # created profile can be materialized before hermes_cli's separate profile
+    # root is visible to list_profiles_api().
+    from api.profiles import get_hermes_home_for_profile
+
+    profile_home = get_hermes_home_for_profile(destination)
+    if not profile_home.is_dir():
+        raise FileNotFoundError(f"Profile '{destination}' not found")
+
+    # A profile's model defaults can be edited immediately before a transfer,
+    # so config.yaml is authoritative over listing metadata.
+    config_path = profile_home / "config.yaml"
+    try:
+        config_data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        config_data = {}
+    model_config = config_data.get("model", {}) if isinstance(config_data, dict) else {}
+    if isinstance(model_config, str):
+        model = model_config
+        provider = None
+    elif isinstance(model_config, dict):
+        model = model_config.get("default")
+        provider = model_config.get("provider")
+    else:
+        model = None
+        provider = None
+    # Preserve compatibility with installations where upstream exposes the
+    # default through profile metadata but has not materialized config.yaml.
+    if profile_row is not None:
+        model = model or profile_row.get("model")
+        provider = provider or profile_row.get("provider")
+    model = str(model or "").strip()
+    provider = str(provider or "").strip().lower() or None
+    if not model:
+        raise ValueError(f"Profile '{destination}' has no default model configured")
+    return destination, model, provider
+
+
+def _clone_webui_session(
+    session,
+    *,
+    profile: str | None = None,
+    model: str | None = None,
+    model_provider: str | None = None,
+    cross_profile: bool = False,
+):
+    """Create an independent native-WebUI copy of a fully loaded session."""
+    destination_profile = profile if cross_profile else session.profile
+    destination_model = model if cross_profile else session.model
+    destination_provider = model_provider if cross_profile else session.model_provider
+    copy_messages = session.messages
+    copy_context = getattr(session, "context_messages", None) or []
+    if _cancelled_journal_turn_owner(session.messages, include_live_partial=True):
+        # Use the same reconciled durable snapshot as the stable duplicate path.
+        # A sidecar can predate later Gateway exchanges.
+        copy_state = get_state_db_session_messages(
+            session.session_id,
+            profile=getattr(session, "profile", None),
+            include_row_identity=True,
+        )
+        copy_messages = reconciled_state_db_messages_for_session(
+            session, state_messages=copy_state,
+        )
+        copy_context = reconciled_state_db_messages_for_session(
+            session, prefer_context=True, state_messages=copy_state,
+        )
+    copied = Session(
+        session_id=uuid.uuid4().hex[:12],
+        title=(session.title or "Untitled") + " (copy)",
+        workspace=session.workspace,
+        created_workspace=getattr(session, "created_workspace", None),
+        model=destination_model,
+        model_provider=destination_provider,
+        messages=copy.deepcopy(copy_messages),
+        tool_calls=copy.deepcopy(session.tool_calls),
+        pinned=False,
+        archived=False,
+        # Project ids are profile-scoped. A cross-profile copy starts outside a
+        # project so it cannot point at a foreign profile's project record.
+        project_id=None if cross_profile else session.project_id,
+        profile=destination_profile,
+        input_tokens=session.input_tokens,
+        output_tokens=session.output_tokens,
+        estimated_cost=session.estimated_cost,
+        cache_read_tokens=getattr(session, "cache_read_tokens", 0),
+        cache_write_tokens=getattr(session, "cache_write_tokens", 0),
+        personality=session.personality,
+        enabled_toolsets=copy.deepcopy(getattr(session, "enabled_toolsets", None)),
+        context_length=0 if cross_profile else getattr(session, "context_length", None),
+        threshold_tokens=0 if cross_profile else getattr(session, "threshold_tokens", None),
+        truncation_watermark=getattr(session, "truncation_watermark", None),
+        truncation_boundary=copy.deepcopy(getattr(session, "truncation_boundary", None)),
+        context_messages=copy.deepcopy(copy_context),
+        gateway_routing=(
+            None
+            if cross_profile
+            else copy.deepcopy(getattr(session, "gateway_routing", None))
+        ),
+        gateway_routing_history=(
+            []
+            if cross_profile
+            else copy.deepcopy(getattr(session, "gateway_routing_history", None) or [])
+        ),
+        llm_title_generated=getattr(session, "llm_title_generated", False),
+        manual_title=getattr(session, "manual_title", False),
+        composer_draft=copy.deepcopy(getattr(session, "composer_draft", None) or {}),
+        context_engine=getattr(session, "context_engine", None),
+        context_engine_state=copy.deepcopy(getattr(session, "context_engine_state", None) or {}),
+        compression_anchor_visible_idx=getattr(session, "compression_anchor_visible_idx", None),
+        compression_anchor_message_key=getattr(session, "compression_anchor_message_key", None),
+        compression_anchor_summary=copy.deepcopy(getattr(session, "compression_anchor_summary", None)),
+        compression_anchor_engine=getattr(session, "compression_anchor_engine", None),
+        compression_anchor_mode=getattr(session, "compression_anchor_mode", None),
+        compression_anchor_details=copy.deepcopy(getattr(session, "compression_anchor_details", None) or {}),
+        anchor_activity_scenes=copy.deepcopy(getattr(session, "anchor_activity_scenes", None) or {}),
+        location=copy.deepcopy(getattr(session, "location", None)),
+        created_at=time.time(),
+        updated_at=time.time(),
+    )
+    # Reconciliation can insert durable rows before a saved tool owner. Map
+    # original rows before deepcopy and update only the cloned tool entries.
+    _reindex_tool_owners_after_message_reorder(
+        copied, session.messages, after_messages=copy_messages,
+    )
+    return copied
+
+
+def _persist_cloned_session(session, *, reason: str) -> None:
+    with LOCK:
+        SESSIONS[session.session_id] = session
+        SESSIONS.move_to_end(session.session_id)
+        _evict_sessions_over_cap()
+    try:
+        session.save()
+    except Exception:
+        with LOCK:
+            SESSIONS.pop(session.session_id, None)
+        raise
+    _publish_session_list_changed(
+        reason,
+        profile=getattr(session, "profile", None),
+        session_id=getattr(session, "session_id", None),
+    )
+
+
 _ANCHOR_ACTIVITY_SCENE_MAX_BYTES = 256_000
 _ANCHOR_ACTIVITY_SCENE_MAX_ROWS = 1_000
 
@@ -5736,6 +5904,71 @@ def _handle_session_anchor_scene(handler, body):
         s.anchor_activity_scenes = records
         s.save(touch_updated_at=False, skip_index=True)
     return j(handler, {"ok": True, "message_index": idx, "message_ref": ref})
+
+
+def _handle_chat_location_get(handler, parsed):
+    """GET /api/location — read the per-session auto-attached location."""
+    qs = parsed.query if hasattr(parsed, "query") else {}
+    if not isinstance(qs, dict):
+        qs = {}
+    sid = str(qs.get("session_id") or "").strip()
+    if not sid:
+        return bad(handler, "session_id is required", 400)
+    try:
+        s = _get_or_materialize_session(sid)
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    except PermissionError:
+        return bad(handler, "Read-only imported sessions cannot be modified", 403)
+    if not _session_visible_to_active_profile(getattr(s, "profile", None) or None, handler):
+        return bad(handler, "Session not found", 404)
+    return j(handler, {"ok": True, "location": getattr(s, "location", None)}, status=200)
+
+
+def _handle_chat_location_set(handler, body):
+    """POST /api/location — set/clear the per-session auto-attached location.
+
+    Mirrors _handle_session_anchor_scene: require session_id, load/maybe
+    materialize, guard visibility, mutate, persist without touching the
+    message index. ``location`` is a small dict like
+    {"lat": 40.746586, "lon": -73.988907, "accuracy_m": 9, "label": "NoMad"}
+    or None to clear.
+    """
+    try:
+        require(body, "session_id")
+    except ValueError as exc:
+        return bad(handler, str(exc))
+    sid = str(body.get("session_id") or "").strip()
+    if not sid:
+        return bad(handler, "session_id is required", 400)
+    raw = body.get("location")
+    if raw is not None and not isinstance(raw, dict):
+        return bad(handler, "location must be an object or null", 400)
+    try:
+        s = _get_or_materialize_session(sid)
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    except PermissionError:
+        return bad(handler, "Read-only imported sessions cannot be modified", 403)
+    if not _session_visible_to_active_profile(getattr(s, "profile", None) or None, handler):
+        return bad(handler, "Session not found", 404)
+    loc = None
+    if raw:
+        try:
+            lat = float(raw.get("lat"))
+            lon = float(raw.get("lon"))
+        except (TypeError, ValueError):
+            return bad(handler, "location.lat and location.lon must be numbers", 400)
+        loc = {
+            "lat": round(lat, 6),
+            "lon": round(lon, 6),
+            "accuracy_m": int(raw.get("accuracy_m") or 0),
+            "label": str(raw.get("label") or "")[:120],
+        }
+    with _get_session_agent_lock(sid):
+        s.location = loc
+        s.save(touch_updated_at=False, skip_index=True)
+    return j(handler, {"ok": True, "location": loc}, status=200)
 
 
 def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False):
@@ -14877,6 +15110,10 @@ def handle_get(handler, parsed) -> bool:
         with profile_env_for_active_request_readonly("/api/providers", logger_override=logger):
             return j(handler, get_providers())
 
+    # ── Per-session location (auto-attach; see _handle_chat_location_*) ──
+    if parsed.path == "/api/location":
+        return _handle_chat_location_get(handler, parsed)
+
     # ── Plugins/hooks visibility (read-only, no callback/source internals) ──
     if parsed.path == "/api/plugins":
         return _handle_plugins(handler, parsed)
@@ -16525,6 +16762,148 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/session/compression-recovery/start":
         return _handle_session_compression_recovery_start(handler, body)
 
+    if parsed.path == "/api/session/profile-transfer":
+        sid = str(body.get("session_id") or "").strip()
+        mode = str(body.get("mode") or "").strip().lower()
+        if not sid:
+            return bad(handler, "session_id is required")
+        if not is_safe_session_id(sid):
+            return bad(handler, "Invalid session_id", 400)
+        if mode not in {"move", "clone"}:
+            return bad(handler, "mode must be 'move' or 'clone'", 400)
+        if _session_is_subagent_view_only(sid):
+            return bad(handler, "Subagent sessions are view-only and cannot be transferred from WebUI", 400)
+
+        try:
+            source = Session.load(sid)
+            if source is None:
+                return bad(handler, "Session not found", status=404)
+            if getattr(source, "read_only", False):
+                return bad(handler, "Read-only imported sessions cannot be transferred from WebUI", 403)
+            # A provider crash or server restart can leave a dead stream marker
+            # on exactly the conversation the user is trying to rescue. Reuse
+            # the established generation-aware stale cleanup before deciding
+            # that a transfer is blocked by live work.
+            if getattr(source, "active_stream_id", None):
+                _clear_stale_stream_state(source)
+                source = Session.load(sid) or source
+
+            source_profile = getattr(source, "profile", None) or "default"
+            destination, destination_model, destination_provider = (
+                _session_profile_transfer_destination(
+                    body.get("destination_profile"),
+                    source_profile,
+                )
+            )
+
+            session_lock = _get_session_agent_lock(sid)
+            if not session_lock.acquire(timeout=5):
+                return bad(handler, "Session busy, try again", 503)
+            try:
+                # Reload under the same lock used by streaming/session mutations,
+                # so the transfer snapshots a complete turn or refuses an active one.
+                source = Session.load(sid)
+                if source is None:
+                    return bad(handler, "Session not found", status=404)
+                if getattr(source, "read_only", False):
+                    return bad(handler, "Read-only imported sessions cannot be transferred from WebUI", 403)
+                if (
+                    getattr(source, "active_stream_id", None)
+                    or getattr(source, "pending_user_message", None)
+                    or getattr(source, "pending_attachments", None)
+                ):
+                    return bad(handler, "Session is active; stop the response before transferring it", 409)
+
+                source_profile = getattr(source, "profile", None) or "default"
+                if _profiles_match(destination, source_profile):
+                    return bad(handler, "Destination profile must differ from the session profile", 400)
+
+                if mode == "clone":
+                    transferred = _clone_webui_session(
+                        source,
+                        profile=destination,
+                        model=destination_model,
+                        model_provider=destination_provider,
+                        cross_profile=True,
+                    )
+                else:
+                    original = {
+                        "profile": source.profile,
+                        "model": source.model,
+                        "model_provider": source.model_provider,
+                        "model_explicit_pick_signature": getattr(source, "model_explicit_pick_signature", None),
+                        "project_id": source.project_id,
+                        "context_length": source.context_length,
+                        "threshold_tokens": source.threshold_tokens,
+                        "last_prompt_tokens": source.last_prompt_tokens,
+                        "gateway_routing": copy.deepcopy(source.gateway_routing),
+                        "gateway_routing_history": copy.deepcopy(source.gateway_routing_history),
+                        "process_wakeup_pause": copy.deepcopy(getattr(source, "process_wakeup_pause", None) or {}),
+                    }
+                    source.profile = destination
+                    source.model = destination_model
+                    source.model_provider = destination_provider
+                    source.model_explicit_pick_signature = None
+                    source.project_id = None
+                    source.context_length = 0
+                    source.threshold_tokens = 0
+                    source.last_prompt_tokens = 0
+                    source.gateway_routing = None
+                    source.gateway_routing_history = []
+                    source.process_wakeup_pause = {}
+                    try:
+                        source.save()
+                    except Exception:
+                        for field, value in original.items():
+                            setattr(source, field, value)
+                        raise
+                    with LOCK:
+                        SESSIONS[sid] = source
+                        SESSIONS.move_to_end(sid)
+                        _evict_sessions_over_cap()
+                    transferred = source
+            finally:
+                session_lock.release()
+
+            if mode == "clone":
+                _persist_cloned_session(transferred, reason="session_profile_clone")
+            else:
+                from api.config import _evict_session_agent
+
+                _evict_session_agent(sid)
+                # Invalidate both scoped sidebar caches: the row disappears from
+                # the source profile and appears in the destination profile.
+                _publish_session_list_changed(
+                    "session_profile_move",
+                    profile=source_profile,
+                    session_id=sid,
+                )
+                _publish_session_list_changed(
+                    "session_profile_move",
+                    profile=destination,
+                    session_id=sid,
+                )
+
+            return j(
+                handler,
+                {
+                    "ok": True,
+                    "mode": mode,
+                    "source_profile": source_profile,
+                    "destination_profile": destination,
+                    "session": public_session_projection(
+                        transferred.compact() | {"messages": transferred.messages}
+                    ),
+                },
+            )
+        except FileNotFoundError as e:
+            return bad(handler, str(e), 404)
+        except ValueError as e:
+            return bad(handler, str(e), 400)
+        except Exception as e:
+            logger.exception("Failed to %s session %s across profiles", mode, sid)
+            return bad(handler, _sanitize_error(e), 500)
+
     if parsed.path == "/api/session/duplicate":
         try:
             sid = body.get("session_id")
@@ -16538,99 +16917,8 @@ def handle_post(handler, parsed) -> bool:
                 # 404, not 400 — missing resource, not a malformed request.
                 return bad(handler, "Session not found", status=404)
 
-            copy_messages = session.messages
-            copy_context = getattr(session, "context_messages", None) or []
-            if _cancelled_journal_turn_owner(session.messages, include_live_partial=True):
-                # Read one complete private snapshot for both persisted layers.
-                # A recovered sidecar can predate later Gateway exchanges.
-                copy_state = get_state_db_session_messages(
-                    sid, profile=getattr(session, "profile", None), include_row_identity=True,
-                )
-                copy_messages = reconciled_state_db_messages_for_session(session, state_messages=copy_state)
-                copy_context = reconciled_state_db_messages_for_session(
-                    session, prefer_context=True, state_messages=copy_state,
-                )
-
-            # Deep-copy mutable lists so the duplicate is *actually* independent.
-            # `Session.__init__` does `self.messages = messages or []` — plain
-            # assignment, no copy. Without deepcopy, both sessions share the same
-            # list object in memory; appending to one mutates the other.
-            # Items inside `messages` are dicts with mutable values (tool_calls,
-            # content arrays), so a shallow `list(...)` is not enough.
-            copied_session = Session(
-                session_id=uuid.uuid4().hex[:12],
-                # Defensive: legacy sessions may have title=None on disk; fall back to 'Untitled'
-                # so `+ " (copy)"` doesn't TypeError.
-                title=(session.title or "Untitled") + " (copy)",
-                workspace=session.workspace,
-                model=session.model,
-                model_provider=session.model_provider,
-                messages=copy.deepcopy(copy_messages),
-                tool_calls=copy.deepcopy(session.tool_calls),
-                # Reset ephemeral / per-session-instance flags. Duplicating an
-                # archived conversation should produce a visible (un-archived)
-                # copy; pinned status doesn't transfer either.
-                pinned=False,
-                archived=False,
-                project_id=session.project_id,
-                profile=session.profile,
-                input_tokens=session.input_tokens,
-                output_tokens=session.output_tokens,
-                estimated_cost=session.estimated_cost,
-                cache_read_tokens=getattr(session, "cache_read_tokens", 0),
-                cache_write_tokens=getattr(session, "cache_write_tokens", 0),
-                # Per-session settings the user may have customized — carry them over
-                # so the duplicate behaves identically until further edits. Compression
-                # anchor + last_prompt_tokens are intentionally NOT carried — those
-                # re-derive on the next turn.
-                personality=session.personality,
-                enabled_toolsets=getattr(session, "enabled_toolsets", None),
-                context_length=getattr(session, "context_length", None),
-                threshold_tokens=getattr(session, "threshold_tokens", None),
-                truncation_watermark=getattr(session, "truncation_watermark", None),
-                truncation_boundary=getattr(session, "truncation_boundary", None),
-                # context_messages is the authoritative model-facing prefix — must be
-                # deepcopied so the duplicate has its own independent context that won't
-                # be mutated when the original session's context changes (#2914).
-                context_messages=copy.deepcopy(copy_context),
-                # Gateway routing — if the user customized routing for this session,
-                # the duplicate should behave identically.
-                gateway_routing=copy.deepcopy(getattr(session, "gateway_routing", None)),
-                gateway_routing_history=copy.deepcopy(getattr(session, "gateway_routing_history", None) or []),
-                # Preserve LLM-generated title flag so we don't regenerate title on duplicate.
-                llm_title_generated=getattr(session, "llm_title_generated", False),
-                manual_title=getattr(session, "manual_title", False),
-                # Composer draft — preserve per-session draft state.
-                composer_draft=copy.deepcopy(getattr(session, "composer_draft", None) or {}),
-                # Context engine state — preserve so the duplicate's context engine
-                # starts from the same point as the original.
-                context_engine=getattr(session, "context_engine", None),
-                context_engine_state=copy.deepcopy(getattr(session, "context_engine_state", None) or {}),
-                created_at=time.time(),
-                updated_at=time.time(),
-            )
-
-            # Reconciliation can insert SQLite rows before a saved tool owner.
-            # Map the original row objects before deepcopy, but update only the
-            # copy's tool dictionaries. Equal assistant prose is not ownership.
-            _reindex_tool_owners_after_message_reorder(
-                copied_session, session.messages, after_messages=copy_messages,
-            )
-
-            with LOCK:
-                SESSIONS[copied_session.session_id] = copied_session
-                SESSIONS.move_to_end(copied_session.session_id)
-                _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
-            # Persist immediately. The pre-PR flow (/api/session/new + /api/session/rename)
-            # accidentally avoided this because `/api/session/rename` calls `s.save()`.
-            # Without this explicit save, the duplicate is in-memory only — if the user
-            # refreshes before sending a turn, the duplicate vanishes.
-            copied_session.save()
-            publish_session_list_changed(
-                "session_duplicate",
-                profile=getattr(copied_session, "profile", None),
-                session_id=getattr(copied_session, "session_id", None),
-            )
+            copied_session = _clone_webui_session(session)
+            _persist_cloned_session(copied_session, reason="session_duplicate")
 
             return j(
                 handler,
@@ -17616,6 +17904,9 @@ def handle_post(handler, parsed) -> bool:
 
     if parsed.path == "/api/bg-task-complete-ack":
         return _handle_bg_task_complete_ack(handler, body)
+
+    if parsed.path == "/api/location":
+        return _handle_chat_location_set(handler, body)
 
     if parsed.path == "/api/chat/start":
         return _handle_chat_start(handler, body, diag=diag)
@@ -23528,8 +23819,23 @@ def _project_context_git_root(start: Path) -> Path | None:
     """Return the nearest git root for project context discovery."""
     current = start.resolve()
     for parent in [current, *current.parents]:
-        if (parent / ".git").exists():
+        # /tmp is a shared scratch boundary, not an operator workspace root.
+        # Never allow a stray /tmp/.git marker to expand a private project
+        # context walk into other temporary jobs.
+        if parent == Path('/tmp').resolve():
+            break
+        marker = parent / ".git"
+        if marker.is_dir():
             return parent
+        if marker.is_file():
+            try:
+                reference = marker.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if reference.startswith("gitdir: "):
+                git_dir = (parent / reference[8:]).resolve()
+                if git_dir.is_dir() and (git_dir / "HEAD").is_file():
+                    return parent
     return None
 
 

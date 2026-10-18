@@ -175,3 +175,9 @@ def test_bootstrap_probe_accepts_ruamel_only():
     body = src[start:start + 600]
     assert "import ruamel.yaml" in body
     assert body.index("from run_agent import AIAgent") < body.index("import yaml")
+
+
+def test_ruamel_parse_error_is_narrow_and_catchable(ruamel_compat):
+    assert ruamel_compat.YAMLError is not Exception
+    with pytest.raises(ruamel_compat.YAMLError):
+        ruamel_compat.safe_load("broken: [")

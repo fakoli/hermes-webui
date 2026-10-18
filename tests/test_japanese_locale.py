@@ -10,14 +10,10 @@ Per PR #1439, `ja` is inserted between `en` and `ru` in the LOCALES object.
 from collections import Counter
 from pathlib import Path
 import re
-from tests.test_issue2147_profile_concept_help import PROFILE_CONCEPT_KEYS
+from tests.test_issue2147_profile_concept_help import ENGLISH_FALLBACK_KEYS
 
 
 REPO = Path(__file__).resolve().parent.parent
-PROFILE_CONCEPT_FALLBACK_KEYS = {
-    *PROFILE_CONCEPT_KEYS,
-    "workspace_artifact_source_session",
-}
 
 
 def read(path: Path) -> str:
@@ -124,7 +120,7 @@ def test_japanese_locale_covers_english_keys():
     en_keys = set(key_pattern.findall(extract_locale_block(src, "en")))
     ja_keys = set(key_pattern.findall(extract_locale_block(src, "ja")))
 
-    missing = sorted((en_keys - ja_keys) - PROFILE_CONCEPT_FALLBACK_KEYS)
+    missing = sorted((en_keys - ja_keys) - ENGLISH_FALLBACK_KEYS)
     assert not missing, f"Japanese locale missing keys: {missing}"
 
 
