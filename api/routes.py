@@ -2558,8 +2558,11 @@ def _build_session_list_cache_payload(
         deduped_cli = []
     diag_stage("sort_sessions")
     merged = webui_sessions + deduped_cli
+    # The public sidebar contract is ordered by session recency. A message
+    # timestamp may be stale or imported independently, so it is only a
+    # deterministic tie-breaker and must never outrank updated_at.
     merged.sort(
-        key=lambda s: s.get("last_message_at") or s.get("updated_at", 0) or 0,
+        key=lambda s: (s.get("updated_at", 0) or 0, s.get("last_message_at") or 0),
         reverse=True,
     )
     # ── Profile scoping (#1611) ────────────────────────────────────────
